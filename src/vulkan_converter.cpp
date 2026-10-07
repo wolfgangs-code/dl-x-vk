@@ -1110,13 +1110,17 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     uint32_t num_cols = grid_cols;
     uint32_t num_rows = grid_rows;
     bool has_bounds = false;
+    bool use_multi_dispatch = false;
+
+    struct TileRange {
+        int c1, c2; // inclusive [c1, c2]
+        int r1, r2; // inclusive [r1, r2]
+    };
+    std::vector<TileRange> disjoint_boxes;
 
     if (!dirty_rects.empty()) {
-        int min_c = static_cast<int>(grid_cols) - 1;
-        int max_c = 0;
-        int min_r = static_cast<int>(grid_rows) - 1;
-        int max_r = 0;
-        bool any_valid = false;
+        std::vector<TileRange> raw_boxes;
+        raw_boxes.reserve(dirty_rects.size());
 
         for (const auto& r : dirty_rects) {
             if (r.x2 <= r.x1 || r.y2 <= r.y1) continue;
@@ -1124,19 +1128,60 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
             int c2 = std::clamp((r.x2 - 1) / tile_size, 0, static_cast<int>(grid_cols) - 1);
             int r1 = std::clamp(r.y1 / tile_size, 0, static_cast<int>(grid_rows) - 1);
             int r2 = std::clamp((r.y2 - 1) / tile_size, 0, static_cast<int>(grid_rows) - 1);
-            min_c = std::min(min_c, c1);
-            max_c = std::max(max_c, c2);
-            min_r = std::min(min_r, r1);
-            max_r = std::max(max_r, r2);
-            any_valid = true;
+            if (c1 <= c2 && r1 <= r2) {
+                raw_boxes.push_back({c1, c2, r1, r2});
+            }
         }
 
-        if (any_valid && min_c <= max_c && min_r <= max_r) {
-            start_col = static_cast<uint32_t>(min_c);
-            start_row = static_cast<uint32_t>(min_r);
-            num_cols  = static_cast<uint32_t>(max_c - min_c + 1);
-            num_rows  = static_cast<uint32_t>(max_r - min_r + 1);
-            has_bounds = true;
+        // Iteratively merge touching or overlapping tile boxes until mutually disjoint
+        for (const auto& box : raw_boxes) {
+            TileRange current = box;
+            bool merged = true;
+            while (merged) {
+                merged = false;
+                for (size_t i = 0; i < disjoint_boxes.size(); ++i) {
+                    const auto& b = disjoint_boxes[i];
+                    // Overlapping or touching boxes
+                    if (!(current.c2 < b.c1 || current.c1 > b.c2 || current.r2 < b.r1 || current.r1 > b.r2)) {
+                        current.c1 = std::min(current.c1, b.c1);
+                        current.c2 = std::max(current.c2, b.c2);
+                        current.r1 = std::min(current.r1, b.r1);
+                        current.r2 = std::max(current.r2, b.r2);
+                        disjoint_boxes.erase(disjoint_boxes.begin() + i);
+                        merged = true;
+                        break;
+                    }
+                }
+            }
+            disjoint_boxes.push_back(current);
+        }
+
+        if (!disjoint_boxes.empty()) {
+            uint32_t sum_disjoint_tiles = 0;
+            int union_c1 = static_cast<int>(grid_cols) - 1, union_c2 = 0;
+            int union_r1 = static_cast<int>(grid_rows) - 1, union_r2 = 0;
+
+            for (const auto& b : disjoint_boxes) {
+                sum_disjoint_tiles += static_cast<uint32_t>((b.c2 - b.c1 + 1) * (b.r2 - b.r1 + 1));
+                union_c1 = std::min(union_c1, b.c1);
+                union_c2 = std::max(union_c2, b.c2);
+                union_r1 = std::min(union_r1, b.r1);
+                union_r2 = std::max(union_r2, b.r2);
+            }
+
+            uint32_t union_tiles = static_cast<uint32_t>((union_c2 - union_c1 + 1) * (union_r2 - union_r1 + 1));
+
+            // Use multi-dispatch when multiple disjoint boxes exist and union bounding box adds >25% wasted tiles
+            if (disjoint_boxes.size() > 1 && union_tiles > static_cast<uint32_t>(sum_disjoint_tiles * 1.25f)) {
+                use_multi_dispatch = true;
+                has_bounds = true;
+            } else {
+                start_col = static_cast<uint32_t>(union_c1);
+                start_row = static_cast<uint32_t>(union_r1);
+                num_cols  = static_cast<uint32_t>(union_c2 - union_c1 + 1);
+                num_rows  = static_cast<uint32_t>(union_r2 - union_r1 + 1);
+                has_bounds = true;
+            }
         }
     }
 
@@ -1145,7 +1190,31 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     vkResetFences(m_device, 1, &m_fence[slot]);
 
     if (curr_fb != m_buf_input[slot].mapped && curr_fb) {
-        if (has_bounds) {
+        if (use_multi_dispatch) {
+            // Coalesce row spans across all disjoint boxes
+            std::vector<std::pair<int, int>> row_spans;
+            row_spans.reserve(disjoint_boxes.size());
+            for (const auto& b : disjoint_boxes) {
+                row_spans.push_back({b.r1, b.r2});
+            }
+            std::sort(row_spans.begin(), row_spans.end());
+            std::vector<std::pair<int, int>> merged_row_spans;
+            for (const auto& span : row_spans) {
+                if (merged_row_spans.empty() || merged_row_spans.back().second < span.first) {
+                    merged_row_spans.push_back(span);
+                } else {
+                    merged_row_spans.back().second = std::max(merged_row_spans.back().second, span.second);
+                }
+            }
+            for (const auto& span : merged_row_spans) {
+                uint32_t start_y = static_cast<uint32_t>(span.first * tile_size);
+                uint32_t end_y = std::min(static_cast<uint32_t>((span.second + 1) * tile_size), static_cast<uint32_t>(height));
+                size_t row_offset = static_cast<size_t>(start_y) * fb_stride;
+                size_t copy_bytes = static_cast<size_t>(end_y - start_y) * fb_stride;
+                std::memcpy(static_cast<uint8_t*>(m_buf_input[slot].mapped) + row_offset,
+                            curr_fb + row_offset, copy_bytes);
+            }
+        } else if (has_bounds) {
             uint32_t start_y = start_row * tile_size;
             uint32_t end_y = std::min((start_row + num_rows) * tile_size, static_cast<uint32_t>(height));
             size_t row_offset = static_cast<size_t>(start_y) * fb_stride;
@@ -1183,22 +1252,43 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mb_clear, 0, nullptr, 0, nullptr);
 
-    // 2. Dispatch Differencing compute kernel restricted to damaged bounding box
-    DiffPushConstants diff_pc = {
-        static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height),
-        static_cast<uint32_t>(stride_words),
-        grid_cols,
-        grid_rows,
-        static_cast<uint32_t>(tile_size),
-        1u, // update reference frame
-        start_col,
-        start_row
-    };
+    // 2. Dispatch Differencing compute kernel restricted to damaged regions
     vkCmdBindPipeline(m_cmd_buffer[slot], VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
     vkCmdBindDescriptorSets(m_cmd_buffer[slot], VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set[slot], 0, nullptr);
-    vkCmdPushConstants(m_cmd_buffer[slot], m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(diff_pc), &diff_pc);
-    vkCmdDispatch(m_cmd_buffer[slot], num_cols, num_rows, 1);
+
+    if (use_multi_dispatch) {
+        for (const auto& b : disjoint_boxes) {
+            DiffPushConstants diff_pc = {
+                static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height),
+                static_cast<uint32_t>(stride_words),
+                grid_cols,
+                grid_rows,
+                static_cast<uint32_t>(tile_size),
+                1u, // update reference frame
+                static_cast<uint32_t>(b.c1),
+                static_cast<uint32_t>(b.r1)
+            };
+            uint32_t b_cols = static_cast<uint32_t>(b.c2 - b.c1 + 1);
+            uint32_t b_rows = static_cast<uint32_t>(b.r2 - b.r1 + 1);
+            vkCmdPushConstants(m_cmd_buffer[slot], m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(diff_pc), &diff_pc);
+            vkCmdDispatch(m_cmd_buffer[slot], b_cols, b_rows, 1);
+        }
+    } else {
+        DiffPushConstants diff_pc = {
+            static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height),
+            static_cast<uint32_t>(stride_words),
+            grid_cols,
+            grid_rows,
+            static_cast<uint32_t>(tile_size),
+            1u, // update reference frame
+            start_col,
+            start_row
+        };
+        vkCmdPushConstants(m_cmd_buffer[slot], m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(diff_pc), &diff_pc);
+        vkCmdDispatch(m_cmd_buffer[slot], num_cols, num_rows, 1);
+    }
 
     // 3. Pipeline Barrier: Differencing -> Copy dirty_count to indirect buffer
     VkBufferMemoryBarrier b_copy = {};

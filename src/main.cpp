@@ -165,6 +165,54 @@ void RunBenchmark() {
 
             LOG_INFO("  Pipelined Double-Buffered Overlap Ingestion: %d passes in %.2f ms", DIRTY_BENCH_PASSES, zc_pipe_ms);
             LOG_INFO("  Pipelined Zero-Copy Throughput: %.2f FPS (%.2f ms/frame)", (DIRTY_BENCH_PASSES * 1000.0) / zc_pipe_ms, zc_pipe_ms / DIRTY_BENCH_PASSES);
+
+            // 5c. Scattered Disjoint Multi-Rect Desktop Evaluation (e.g., Cursor, Notification, Taskbar)
+            LOG_INFO("[Disjoint Multi-Rect Desktop Damage Evaluation (Scattered Windows)]");
+            std::vector<dl_turbo::DirtyRect> multi_rects = {
+                { 0, 0, 160, 160 },           // Top-left window (25 tiles)
+                { 3680, 0, 3840, 160 },       // Top-right notification (25 tiles)
+                { 1840, 2000, 2000, 2160 }    // Bottom-center taskbar (25 tiles)
+            };
+            std::vector<dl_turbo::DirtyRect> union_rect = {
+                { 0, 0, 3840, 2160 }          // Inflated 8,160 tile bounding box
+            };
+
+            const int MULTI_PASSES = 50;
+            // Benchmark naive union bounding box
+            auto start_union = std::chrono::high_resolution_clock::now();
+            for (int p = 0; p < MULTI_PASSES; ++p) {
+                uint8_t* cur_mapped = (p % 2 == 0) ? mapped_fb0 : mapped_fb1;
+                cur_mapped[0] ^= static_cast<uint8_t>(p + 1);
+                cur_mapped[(0 * WIDTH + 3680) * 4] ^= static_cast<uint8_t>(p + 1);
+                cur_mapped[(2000 * WIDTH + 1840) * 4] ^= static_cast<uint8_t>(p + 1);
+                vk.EncodeFramePacketsGpu(cur_mapped, WIDTH * 4, WIDTH, HEIGHT, 32, p + 300, total_packet_bytes, union_rect, true);
+            }
+            uint32_t union_flush = 0;
+            vk.FlushFramePacketsGpu(union_flush);
+            auto end_union = std::chrono::high_resolution_clock::now();
+            double union_ms = std::chrono::duration<double, std::milli>(end_union - start_union).count();
+
+            // Benchmark disjoint multi-rect differencing
+            auto start_multi = std::chrono::high_resolution_clock::now();
+            for (int p = 0; p < MULTI_PASSES; ++p) {
+                uint8_t* cur_mapped = (p % 2 == 0) ? mapped_fb0 : mapped_fb1;
+                cur_mapped[0] ^= static_cast<uint8_t>(p + 1);
+                cur_mapped[(0 * WIDTH + 3680) * 4] ^= static_cast<uint8_t>(p + 1);
+                cur_mapped[(2000 * WIDTH + 1840) * 4] ^= static_cast<uint8_t>(p + 1);
+                vk.EncodeFramePacketsGpu(cur_mapped, WIDTH * 4, WIDTH, HEIGHT, 32, p + 400, total_packet_bytes, multi_rects, true);
+            }
+            uint32_t multi_flush = 0;
+            vk.FlushFramePacketsGpu(multi_flush);
+            auto end_multi = std::chrono::high_resolution_clock::now();
+            double multi_ms = std::chrono::duration<double, std::milli>(end_multi - start_multi).count();
+
+            double union_fps = (MULTI_PASSES * 1000.0) / union_ms;
+            double multi_fps = (MULTI_PASSES * 1000.0) / multi_ms;
+
+            LOG_INFO("  Naive Bounding Box Union (8,160 tiles tested): %.2f FPS (%.2f ms/frame)", union_fps, union_ms / MULTI_PASSES);
+            LOG_INFO("  Disjoint Multi-Rect Filter  (75 tiles tested):    %.2f FPS (%.2f ms/frame)", multi_fps, multi_ms / MULTI_PASSES);
+            LOG_INFO("  Speedup across scattered damaged windows:        %.1fx faster (%.2f ms latency saved per frame)",
+                     multi_fps / union_fps, (union_ms - multi_ms) / MULTI_PASSES);
         }
 
         // 6. USB Transport Layer Pipeline Evaluation (Synchronous vs Async Multi-URB Ring Queue)
