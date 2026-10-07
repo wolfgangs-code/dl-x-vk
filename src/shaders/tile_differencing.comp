@@ -10,6 +10,8 @@ layout(push_constant) uniform PushConstants {
     uint grid_rows;
     uint tile_size;
     uint update_ref;
+    uint start_col;
+    uint start_row;
 } pc;
 
 layout(std430, binding = 0) readonly buffer CurrentFrame {
@@ -32,8 +34,8 @@ layout(std430, binding = 3) buffer DirtyList {
 shared uint s_dirty;
 
 void main() {
-    uint tile_x = gl_WorkGroupID.x;
-    uint tile_y = gl_WorkGroupID.y;
+    uint tile_x = pc.start_col + gl_WorkGroupID.x;
+    uint tile_y = pc.start_row + gl_WorkGroupID.y;
 
     if (tile_x >= pc.grid_cols || tile_y >= pc.grid_rows) return;
 

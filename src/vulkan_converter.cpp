@@ -34,6 +34,8 @@ struct DiffPushConstants {
     uint32_t grid_rows;
     uint32_t tile_size;
     uint32_t update_ref;
+    uint32_t start_col;
+    uint32_t start_row;
 };
 
 struct CompPushConstants {
@@ -688,7 +690,11 @@ bool VulkanConverter::DispatchTileDifferencing(
     int height,
     int stride_words,
     int tile_size,
-    bool update_reference
+    bool update_reference,
+    uint32_t start_col,
+    uint32_t start_row,
+    uint32_t num_cols,
+    uint32_t num_rows
 ) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized) return false;
@@ -700,6 +706,9 @@ bool VulkanConverter::DispatchTileDifferencing(
 
     if (!EnsureDiffBuffers(fb_size, total_tiles)) return false;
 
+    if (num_cols == 0) num_cols = (start_col < grid_cols) ? (grid_cols - start_col) : 1;
+    if (num_rows == 0) num_rows = (start_row < grid_rows) ? (grid_rows - start_row) : 1;
+
     DiffPushConstants pc = {
         static_cast<uint32_t>(width),
         static_cast<uint32_t>(height),
@@ -707,7 +716,9 @@ bool VulkanConverter::DispatchTileDifferencing(
         grid_cols,
         grid_rows,
         static_cast<uint32_t>(tile_size),
-        update_reference ? 1u : 0u
+        update_reference ? 1u : 0u,
+        start_col,
+        start_row
     };
 
     VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr };
@@ -726,7 +737,7 @@ bool VulkanConverter::DispatchTileDifferencing(
     vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set, 0, nullptr);
     vkCmdPushConstants(m_cmd_buffer, m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    vkCmdDispatch(m_cmd_buffer, grid_cols, grid_rows, 1);
+    vkCmdDispatch(m_cmd_buffer, num_cols, num_rows, 1);
 
     VkMemoryBarrier mb_host = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                 VK_ACCESS_SHADER_WRITE_BIT,
@@ -976,7 +987,8 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     int height,
     int tile_size,
     uint32_t frame_index,
-    uint32_t& out_total_packet_bytes
+    uint32_t& out_total_packet_bytes,
+    const std::vector<DirtyRect>& dirty_rects
 ) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized) return nullptr;
@@ -993,8 +1005,53 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
 
     UpdateCompDescriptors();
 
+    uint32_t start_col = 0;
+    uint32_t start_row = 0;
+    uint32_t num_cols = grid_cols;
+    uint32_t num_rows = grid_rows;
+    bool has_bounds = false;
+
+    if (!dirty_rects.empty()) {
+        int min_c = static_cast<int>(grid_cols) - 1;
+        int max_c = 0;
+        int min_r = static_cast<int>(grid_rows) - 1;
+        int max_r = 0;
+        bool any_valid = false;
+
+        for (const auto& r : dirty_rects) {
+            if (r.x2 <= r.x1 || r.y2 <= r.y1) continue;
+            int c1 = std::clamp(r.x1 / tile_size, 0, static_cast<int>(grid_cols) - 1);
+            int c2 = std::clamp((r.x2 - 1) / tile_size, 0, static_cast<int>(grid_cols) - 1);
+            int r1 = std::clamp(r.y1 / tile_size, 0, static_cast<int>(grid_rows) - 1);
+            int r2 = std::clamp((r.y2 - 1) / tile_size, 0, static_cast<int>(grid_rows) - 1);
+            min_c = std::min(min_c, c1);
+            max_c = std::max(max_c, c2);
+            min_r = std::min(min_r, r1);
+            max_r = std::max(max_r, r2);
+            any_valid = true;
+        }
+
+        if (any_valid && min_c <= max_c && min_r <= max_r) {
+            start_col = static_cast<uint32_t>(min_c);
+            start_row = static_cast<uint32_t>(min_r);
+            num_cols  = static_cast<uint32_t>(max_c - min_c + 1);
+            num_rows  = static_cast<uint32_t>(max_r - min_r + 1);
+            has_bounds = true;
+        }
+    }
+
     if (curr_fb && curr_fb != m_buf_input.mapped) {
-        std::memcpy(m_buf_input.mapped, curr_fb, fb_size);
+        if (has_bounds) {
+            // Fast Path: Only copy the rows covered by the dirty bounding box!
+            uint32_t start_y = start_row * tile_size;
+            uint32_t end_y = std::min((start_row + num_rows) * tile_size, static_cast<uint32_t>(height));
+            size_t row_offset = static_cast<size_t>(start_y) * fb_stride;
+            size_t copy_bytes = static_cast<size_t>(end_y - start_y) * fb_stride;
+            std::memcpy(static_cast<uint8_t*>(m_buf_input.mapped) + row_offset,
+                        curr_fb + row_offset, copy_bytes);
+        } else {
+            std::memcpy(m_buf_input.mapped, curr_fb, fb_size);
+        }
     }
 
     int stride_words = fb_stride / 4;
@@ -1025,7 +1082,7 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mb_clear, 0, nullptr, 0, nullptr);
 
-    // 2. Dispatch Differencing compute kernel
+    // 2. Dispatch Differencing compute kernel restricted to damaged bounding box
     DiffPushConstants diff_pc = {
         static_cast<uint32_t>(width),
         static_cast<uint32_t>(height),
@@ -1033,12 +1090,14 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         grid_cols,
         grid_rows,
         static_cast<uint32_t>(tile_size),
-        1u // update reference frame
+        1u, // update reference frame
+        start_col,
+        start_row
     };
     vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
     vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set, 0, nullptr);
     vkCmdPushConstants(m_cmd_buffer, m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(diff_pc), &diff_pc);
-    vkCmdDispatch(m_cmd_buffer, grid_cols, grid_rows, 1);
+    vkCmdDispatch(m_cmd_buffer, num_cols, num_rows, 1);
 
     // 3. Pipeline Barrier: Differencing -> Copy dirty_count to indirect buffer
     VkBufferMemoryBarrier b_copy = {};

@@ -97,22 +97,22 @@ void RunBenchmark() {
                      hdr->tile_count, total_packet_bytes / 1024, hdr->magic);
         }
 
-        // Benchmark incremental update: modify 100 tiles per frame
+        // Benchmark incremental update: modify 100 tiles per frame in an active window
         const int DIRTY_BENCH_PASSES = 50;
+        std::vector<dl_turbo::DirtyRect> dirty_rects = { { 0, 0, 320, 320 } }; // 10x10 tile active window
         auto start_comp = std::chrono::high_resolution_clock::now();
         for (int p = 0; p < DIRTY_BENCH_PASSES; ++p) {
-            // Touch 100 tiles across the screen
             for (int t = 0; t < 100; ++t) {
-                int px = (t * 32) % WIDTH;
-                int py = ((t * 32) / WIDTH) * 32;
+                int px = (t % 10) * 32;
+                int py = (t / 10) * 32;
                 rgb_buffer[(py * WIDTH + px) * 4] ^= static_cast<uint8_t>(p + 1);
             }
-            vk.EncodeFramePacketsGpu(rgb_buffer.data(), WIDTH * 4, WIDTH, HEIGHT, 32, p + 2, total_packet_bytes);
+            vk.EncodeFramePacketsGpu(rgb_buffer.data(), WIDTH * 4, WIDTH, HEIGHT, 32, p + 2, total_packet_bytes, dirty_rects);
         }
         auto end_comp = std::chrono::high_resolution_clock::now();
         double comp_ms = std::chrono::duration<double, std::milli>(end_comp - start_comp).count();
 
-        LOG_INFO("  Incremental Update (100 Dirty Tiles): %d passes in %.2f ms", DIRTY_BENCH_PASSES, comp_ms);
+        LOG_INFO("  Incremental Update (100 Clipped Dirty Tiles): %d passes in %.2f ms", DIRTY_BENCH_PASSES, comp_ms);
         LOG_INFO("  Throughput: %.2f FPS (%.2f ms/frame)", (DIRTY_BENCH_PASSES * 1000.0) / comp_ms, comp_ms / DIRTY_BENCH_PASSES);
     }
 

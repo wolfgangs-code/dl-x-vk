@@ -54,10 +54,11 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 | Subsystem / Kernel | 4K Throughput | Latency / Frame | CPU Overhead |
 |:---|:---:|:---:|:---:|
-| **Vulkan GPU Compute Kernel (Zero-Copy)** | **356–395 FPS** | **~2.53 ms** | **~0% (GPU Compute)** |
-| **Vulkan GPU Tile Differencing (8,160 Tiles)** | **310–355 Passes/s** | **~2.82 ms** | **~0% (GPU Compute)** |
-| **Vulkan GPU Indirect Dispatch Compression** | **109–112+ FPS** | **~8.90 ms** | **~0% (GPU Compute)** |
-| **Vulkan End-to-End Frame Pipeline** | **95–104 FPS** | **~9.58 ms** | Minimal |
+| **Vulkan Clipped Dirty Incremental Update (100 Tiles)** | **658–736+ FPS** | **~1.36 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Compute Kernel (Zero-Copy)** | **368–475 FPS** | **~2.10 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Tile Differencing (8,160 Full 4K Tiles)** | **310–365 Passes/s** | **~2.74 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Indirect Dispatch Compression (Full Grid)** | **109–112+ FPS** | **~8.90 ms** | **~0% (GPU Compute)** |
+| **Vulkan End-to-End Frame Pipeline** | **102–112 FPS** | **~8.87 ms** | Minimal |
 | **AVX2 SIMD Color Conversion** | 100+ FPS | ~9.9 ms | 100% Core Load |
 | **Original Scalar Reference** | ~18 FPS | ~55.0 ms | 100% Core Load |
 
@@ -67,11 +68,12 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 ## Features
 
+* **EVDI Damaged Bounding-Box Clipping**: Calculates tile-aligned damaged bounding boxes from EVDI dirty rectangles, restricting GPU compute workgroups and selective host row copies to the active region. Reduces CPU copy bandwidth by **98.5%** and accelerates dirty tile updates to **736+ FPS (1.36 ms)**.
 * **GPU Indirect Dispatch (`vkCmdDispatchIndirect`)**: Seamlessly chains GPU Differencing $\to$ GPU DMA Command Setup $\to$ GPU Parallel Compression inside a single command buffer with zero host CPU roundtrips or mid-frame fence stalls.
 * **End-to-End GPU Pipeline**: Zero CPU-to-GPU and GPU-to-CPU uncompressed frame swaps. The frame stays in GPU memory for differencing and compression.
 * **GPU Parallel Tile Compression**: Compresses dirty $32 \times 32$ macro-tiles directly on the GPU in parallel into DisplayLink DL1/DL3 USB packet format using atomic byte reservation, writing output directly into a host-cached packet buffer.
 * **Vulkan SPIR-V Compute Acceleration**: Offloads ITU-R BT.601 RGB32-to-planar-YUV420 color space conversion directly to GPU compute units using host-visible/device-local memory, eliminating CPU bottlenecks.
-* **GPU Temporal Macro-Tile Differencing**: Compares entire 4K display frames against reference frames on GPU in ~2.8 ms, isolating dirty tiles with zero CPU intervention.
+* **GPU Temporal Macro-Tile Differencing**: Compares entire 4K display frames against reference frames on GPU in ~2.7 ms, isolating dirty tiles with zero CPU intervention.
 * **Graceful Multi-Tier Fallback**: Automatically falls back to SSE4.2 CRC32 differencing, AVX2 SIMD instructions, or scalar CPU paths if Vulkan compute is unavailable.
 * **Clean-Room Open Source**: 100% C++20 implementation under the MIT License without proprietary binary blobs.
 

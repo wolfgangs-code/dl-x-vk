@@ -140,7 +140,7 @@ void DisplayLinkService::OnFrameReady(
     if (vk.IsAvailable()) {
         uint32_t total_packet_bytes = 0;
         const uint8_t* packet_data = vk.EncodeFramePacketsGpu(
-            fb_data, stride, width, height, 32, m_frame_counter, total_packet_bytes
+            fb_data, stride, width, height, 32, m_frame_counter, total_packet_bytes, dirty_rects
         );
 
         if (packet_data && total_packet_bytes > sizeof(protocol::FrameSectionHeader)) {

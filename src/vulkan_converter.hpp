@@ -72,7 +72,11 @@ public:
         int height,
         int stride_words,
         int tile_size,
-        bool update_reference
+        bool update_reference,
+        uint32_t start_col = 0,
+        uint32_t start_row = 0,
+        uint32_t num_cols = 0,
+        uint32_t num_rows = 0
     );
 
     // GPU-accelerated parallel tile compression directly into DisplayLink USB packet format
@@ -83,7 +87,8 @@ public:
         int height,
         int tile_size,
         uint32_t frame_index,
-        uint32_t& out_total_packet_bytes
+        uint32_t& out_total_packet_bytes,
+        const std::vector<DirtyRect>& dirty_rects = {}
     );
 
     uint32_t GetDirtyTileCount() const;
