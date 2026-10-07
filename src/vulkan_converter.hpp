@@ -156,6 +156,7 @@ private:
 
     VulkanBuffer m_buf_packet_meta; // uint32 total_packet_bytes atomic counter
     VulkanBuffer m_buf_packet_out;  // Contiguous USB packet payload (Host-Cached)
+    VulkanBuffer m_buf_indirect;    // VkDispatchIndirectCommand for GPU indirect dispatch
     size_t m_packet_capacity = 0;
 };
 

@@ -40,7 +40,7 @@ shared uint s_comp_type;
 
 void main() {
     uint workgroup_id = gl_WorkGroupID.x;
-    if (workgroup_id >= pc.dirty_tile_count) return;
+    if (workgroup_id >= in_dirty_count) return;
 
     uint tile_id = dirty_tile_ids[workgroup_id];
     uint col = tile_id % pc.grid_cols;
