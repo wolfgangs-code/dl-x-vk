@@ -45,16 +45,26 @@ public:
         std::vector<uint8_t>& out_tile_buf
     ) const;
 
+    // Filter dirty tiles using 64-bit SIMD/CRC32 temporal differencing against cached frame
+    std::vector<TileCoordinate> FilterChangedTiles(
+        const uint8_t* master_fb,
+        int fb_stride,
+        const std::vector<TileCoordinate>& candidate_tiles
+    );
+
     int GetTileSize() const { return m_tile_size; }
     int GetGridCols() const { return m_grid_cols; }
     int GetGridRows() const { return m_grid_rows; }
 
 private:
+    uint64_t ComputeTileHash(const uint8_t* master_fb, int fb_stride, const TileCoordinate& tile) const;
+
     int m_screen_width;
     int m_screen_height;
     int m_tile_size;
     int m_grid_cols;
     int m_grid_rows;
+    std::vector<uint64_t> m_tile_hashes;
 };
 
 } // namespace dl_turbo

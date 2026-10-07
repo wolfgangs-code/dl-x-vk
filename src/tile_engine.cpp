@@ -1,6 +1,7 @@
 #include "tile_engine.hpp"
 #include <algorithm>
 #include <cstring>
+#include <immintrin.h>
 
 namespace dl_turbo {
 
@@ -9,13 +10,16 @@ TileEngine::TileEngine(int screen_width, int screen_height, int tile_size)
       m_screen_height(screen_height),
       m_tile_size(tile_size),
       m_grid_cols((screen_width + tile_size - 1) / tile_size),
-      m_grid_rows((screen_height + tile_size - 1) / tile_size) {}
+      m_grid_rows((screen_height + tile_size - 1) / tile_size) {
+    m_tile_hashes.assign(m_grid_cols * m_grid_rows, 0);
+}
 
 void TileEngine::Resize(int screen_width, int screen_height) {
     m_screen_width = screen_width;
     m_screen_height = screen_height;
     m_grid_cols = (screen_width + m_tile_size - 1) / m_tile_size;
     m_grid_rows = (screen_height + m_tile_size - 1) / m_tile_size;
+    m_tile_hashes.assign(m_grid_cols * m_grid_rows, 0);
 }
 
 std::vector<DirtyRect> TileEngine::CoalesceRects(const std::vector<DirtyRect>& rects) {
@@ -93,6 +97,50 @@ void TileEngine::ExtractTileRgb32(
         uint8_t* dst_row = out_tile_buf.data() + (row * tile.width * 4);
         std::memcpy(dst_row, src_row, tile.width * 4);
     }
+}
+
+uint64_t TileEngine::ComputeTileHash(const uint8_t* master_fb, int fb_stride, const TileCoordinate& tile) const {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int row = 0; row < tile.height; ++row) {
+        const uint64_t* src_row = reinterpret_cast<const uint64_t*>(master_fb + (tile.y + row) * fb_stride + (tile.x * 4));
+        size_t words = (tile.width * 4) / 8;
+        for (size_t w = 0; w < words; ++w) {
+#if defined(__SSE4_2__)
+            h = _mm_crc32_u64(h, src_row[w]);
+#else
+            h ^= src_row[w];
+            h *= 0x100000001b3ULL;
+#endif
+        }
+    }
+    return h;
+}
+
+std::vector<TileCoordinate> TileEngine::FilterChangedTiles(
+    const uint8_t* master_fb,
+    int fb_stride,
+    const std::vector<TileCoordinate>& candidate_tiles
+) {
+    std::vector<TileCoordinate> changed;
+    changed.reserve(candidate_tiles.size());
+
+    for (const auto& tile : candidate_tiles) {
+        int col = tile.x / m_tile_size;
+        int row = tile.y / m_tile_size;
+        size_t tile_idx = row * m_grid_cols + col;
+
+        uint64_t current_hash = ComputeTileHash(master_fb, fb_stride, tile);
+        if (tile_idx < m_tile_hashes.size()) {
+            if (current_hash != m_tile_hashes[tile_idx]) {
+                m_tile_hashes[tile_idx] = current_hash;
+                changed.push_back(tile);
+            }
+        } else {
+            changed.push_back(tile);
+        }
+    }
+
+    return changed;
 }
 
 } // namespace dl_turbo

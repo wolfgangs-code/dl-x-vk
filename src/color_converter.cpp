@@ -83,21 +83,59 @@ void ColorConverter::Rgb32ToYuv420Avx2(
     int dst_y_stride,
     int dst_uv_stride
 ) {
-    // Scalar fallback for remaining rows or when unaligned
+    const __m256i coeff_r = _mm256_set1_epi32(66);
+    const __m256i coeff_g = _mm256_set1_epi32(129);
+    const __m256i coeff_b = _mm256_set1_epi32(25);
+    const __m256i round_bias = _mm256_set1_epi32(128);
+    const __m256i add_16 = _mm256_set1_epi32(16);
+
     for (int y = 0; y < height; ++y) {
         const uint32_t* src_row = reinterpret_cast<const uint32_t*>(src_argb + y * src_stride);
         uint8_t* y_row = dst_y + y * dst_y_stride;
         uint8_t* u_row = dst_u + (y / 2) * dst_uv_stride;
         uint8_t* v_row = dst_v + (y / 2) * dst_uv_stride;
 
-        for (int x = 0; x < width; ++x) {
+        int x = 0;
+        for (; x <= width - 8; x += 8) {
+            __m256i pixels = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_row + x));
+            __m256i b = _mm256_and_si256(pixels, _mm256_set1_epi32(0xFF));
+            __m256i g = _mm256_and_si256(_mm256_srli_epi32(pixels, 8), _mm256_set1_epi32(0xFF));
+            __m256i r = _mm256_and_si256(_mm256_srli_epi32(pixels, 16), _mm256_set1_epi32(0xFF));
+
+            __m256i prod_r = _mm256_mullo_epi32(r, coeff_r);
+            __m256i prod_g = _mm256_mullo_epi32(g, coeff_g);
+            __m256i prod_b = _mm256_mullo_epi32(b, coeff_b);
+
+            __m256i sum = _mm256_add_epi32(prod_r, _mm256_add_epi32(prod_g, _mm256_add_epi32(prod_b, round_bias)));
+            __m256i y32 = _mm256_add_epi32(_mm256_srli_epi32(sum, 8), add_16);
+
+            __m256i y16 = _mm256_packs_epi32(y32, y32);
+            __m256i y8  = _mm256_packus_epi16(y16, y16);
+
+            uint64_t val0 = _mm_cvtsi128_si64(_mm256_castsi256_si128(y8));
+            *reinterpret_cast<uint32_t*>(y_row + x) = static_cast<uint32_t>(val0);
+            __m128i hi128 = _mm256_extracti128_si256(y8, 1);
+            *reinterpret_cast<uint32_t*>(y_row + x + 4) = static_cast<uint32_t>(_mm_cvtsi128_si64(hi128));
+
+            if (y % 2 == 0) {
+                for (int sub_x = 0; sub_x < 8; sub_x += 2) {
+                    uint32_t p = src_row[x + sub_x];
+                    int32_t pb = (p & 0xFF);
+                    int32_t pg = ((p >> 8) & 0xFF);
+                    int32_t pr = ((p >> 16) & 0xFF);
+                    u_row[(x + sub_x) / 2] = clamp_u8(((-38 * pr - 74 * pg + 112 * pb + 128) >> 8) + 128);
+                    v_row[(x + sub_x) / 2] = clamp_u8(((112 * pr - 94 * pg - 18 * pb + 128) >> 8) + 128);
+                }
+            }
+        }
+
+        for (; x < width; ++x) {
             uint32_t pixel = src_row[x];
             int32_t b = (pixel & 0xFF);
             int32_t g = ((pixel >> 8) & 0xFF);
             int32_t r = ((pixel >> 16) & 0xFF);
 
-            int32_t y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_row[x] = clamp_u8(y_val);
+            y_row[x] = clamp_u8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
 
             if ((y % 2 == 0) && (x % 2 == 0)) {
                 int32_t u_val = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;

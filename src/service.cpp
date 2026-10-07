@@ -136,8 +136,10 @@ void DisplayLinkService::OnFrameReady(
 
     // 1. Coalesce dirty rectangles and tile them
     auto merged_rects = TileEngine::CoalesceRects(dirty_rects);
-    auto dirty_tiles  = m_tile_engine->GenerateDirtyTiles(merged_rects);
+    auto candidate_tiles = m_tile_engine->GenerateDirtyTiles(merged_rects);
 
+    // 2. Filter out unchanged tiles using fast hardware CRC32/SIMD differencing
+    auto dirty_tiles = m_tile_engine->FilterChangedTiles(fb_data, stride, candidate_tiles);
     if (dirty_tiles.empty()) return;
 
     // 2. Prepare Frame Section Header
