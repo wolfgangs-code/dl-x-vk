@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.a
+*.so
+*.dylib
+compile_commands.json
+
+# Binary firmware and proprietary dumps
+*.spkg
+*.sym
+*.dump
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Temporary files
+/scratch/
+*.log
