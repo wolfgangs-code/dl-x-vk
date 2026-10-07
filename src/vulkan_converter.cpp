@@ -1,5 +1,6 @@
 #include "vulkan_converter.hpp"
 #include "common.hpp"
+#include "protocol.hpp"
 #include <cstring>
 #include <algorithm>
 
@@ -11,6 +12,10 @@ static const uint32_t s_rgb_to_yuv420_spv[] =
 
 static const uint32_t s_tile_differencing_spv[] =
 #include "shaders/tile_differencing_spv.inc"
+;
+
+static const uint32_t s_tile_compression_spv[] =
+#include "shaders/tile_compression_spv.inc"
 ;
 
 struct ColorPushConstants {
@@ -29,6 +34,16 @@ struct DiffPushConstants {
     uint32_t grid_rows;
     uint32_t tile_size;
     uint32_t update_ref;
+};
+
+struct CompPushConstants {
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride_words;
+    uint32_t grid_cols;
+    uint32_t grid_rows;
+    uint32_t tile_size;
+    uint32_t dirty_tile_count;
 };
 
 VulkanConverter& VulkanConverter::Instance() {
@@ -275,6 +290,7 @@ bool VulkanConverter::EnsureDiffBuffers(size_t fb_size, uint32_t total_tiles) {
         writes[i].pBufferInfo = &dbi[i];
     }
     vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+    UpdateCompDescriptors();
 
     return true;
 }
@@ -448,9 +464,44 @@ bool VulkanConverter::Initialize() {
         return false;
     }
 
-    // 6. Descriptor Pools & Sets
-    VkDescriptorPoolSize poolSizes[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 } };
-    VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 2, 1, poolSizes };
+    // 6. Tile Compression Pipeline
+    VkShaderModuleCreateInfo compModuleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
+                                                sizeof(s_tile_compression_spv), s_tile_compression_spv };
+    if (vkCreateShaderModule(m_device, &compModuleInfo, nullptr, &m_comp_shader_module) != VK_SUCCESS) {
+        LOG_ERROR("Failed to create tile compression shader module");
+        Cleanup();
+        return false;
+    }
+
+    VkDescriptorSetLayoutCreateInfo compLayoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 4, bindings };
+    if (vkCreateDescriptorSetLayout(m_device, &compLayoutInfo, nullptr, &m_comp_desc_layout) != VK_SUCCESS) {
+        LOG_ERROR("Failed to create comp descriptor set layout");
+        Cleanup();
+        return false;
+    }
+
+    VkPushConstantRange compPush = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CompPushConstants) };
+    VkPipelineLayoutCreateInfo compPipelineLayoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &m_comp_desc_layout, 1, &compPush };
+    if (vkCreatePipelineLayout(m_device, &compPipelineLayoutInfo, nullptr, &m_comp_pipeline_layout) != VK_SUCCESS) {
+        LOG_ERROR("Failed to create comp pipeline layout");
+        Cleanup();
+        return false;
+    }
+
+    VkComputePipelineCreateInfo compPipelineInfo = {
+        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0,
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m_comp_shader_module, "main", nullptr },
+        m_comp_pipeline_layout, VK_NULL_HANDLE, 0
+    };
+    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &compPipelineInfo, nullptr, &m_comp_pipeline) != VK_SUCCESS) {
+        LOG_ERROR("Failed to create comp compute pipeline");
+        Cleanup();
+        return false;
+    }
+
+    // 7. Descriptor Pools & Sets
+    VkDescriptorPoolSize poolSizes[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 } };
+    VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 4, 1, poolSizes };
 
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_desc_pool) != VK_SUCCESS) {
         LOG_ERROR("Failed to create descriptor pool");
@@ -472,7 +523,14 @@ bool VulkanConverter::Initialize() {
         return false;
     }
 
-    // 7. Command Pool & Command Buffer & Fence
+    VkDescriptorSetAllocateInfo compAllocSetInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 1, &m_comp_desc_layout };
+    if (vkAllocateDescriptorSets(m_device, &compAllocSetInfo, &m_comp_desc_set) != VK_SUCCESS) {
+        LOG_ERROR("Failed to allocate comp descriptor set");
+        Cleanup();
+        return false;
+    }
+
+    // 8. Command Pool & Command Buffer & Fence
     VkCommandPoolCreateInfo cmdPoolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
                                             VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, m_compute_queue_family };
     if (vkCreateCommandPool(m_device, &cmdPoolInfo, nullptr, &m_cmd_pool) != VK_SUCCESS) {
@@ -497,7 +555,7 @@ bool VulkanConverter::Initialize() {
     }
 
     m_initialized = true;
-    LOG_INFO("Vulkan SPIR-V compute acceleration (Color + Tile Differencing) initialized successfully");
+    LOG_INFO("Vulkan SPIR-V compute acceleration (Color + Diff + Tile Compression) initialized successfully");
     return true;
 }
 
@@ -512,6 +570,9 @@ void VulkanConverter::Cleanup() {
         DestroyBuffer(m_buf_diff_ref);
         DestroyBuffer(m_buf_diff_mask);
         DestroyBuffer(m_buf_diff_list);
+        DestroyBuffer(m_buf_packet_meta);
+        DestroyBuffer(m_buf_packet_out);
+        m_packet_capacity = 0;
 
         if (m_fence != VK_NULL_HANDLE) { vkDestroyFence(m_device, m_fence, nullptr); m_fence = VK_NULL_HANDLE; }
         if (m_cmd_pool != VK_NULL_HANDLE) { vkDestroyCommandPool(m_device, m_cmd_pool, nullptr); m_cmd_pool = VK_NULL_HANDLE; }
@@ -526,6 +587,11 @@ void VulkanConverter::Cleanup() {
         if (m_diff_pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_diff_pipeline_layout, nullptr); m_diff_pipeline_layout = VK_NULL_HANDLE; }
         if (m_diff_desc_layout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_diff_desc_layout, nullptr); m_diff_desc_layout = VK_NULL_HANDLE; }
         if (m_diff_shader_module != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_diff_shader_module, nullptr); m_diff_shader_module = VK_NULL_HANDLE; }
+
+        if (m_comp_pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_comp_pipeline, nullptr); m_comp_pipeline = VK_NULL_HANDLE; }
+        if (m_comp_pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_comp_pipeline_layout, nullptr); m_comp_pipeline_layout = VK_NULL_HANDLE; }
+        if (m_comp_desc_layout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_comp_desc_layout, nullptr); m_comp_desc_layout = VK_NULL_HANDLE; }
+        if (m_comp_shader_module != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_comp_shader_module, nullptr); m_comp_shader_module = VK_NULL_HANDLE; }
 
         vkDestroyDevice(m_device, nullptr);
         m_device = VK_NULL_HANDLE;
@@ -787,6 +853,210 @@ bool VulkanConverter::FilterDirtyTilesGpu(
     }
 
     return true;
+}
+
+void VulkanConverter::UpdateCompDescriptors() {
+    if (m_comp_desc_set == VK_NULL_HANDLE ||
+        m_buf_input.buffer == VK_NULL_HANDLE ||
+        m_buf_diff_list.buffer == VK_NULL_HANDLE ||
+        m_buf_packet_meta.buffer == VK_NULL_HANDLE ||
+        m_buf_packet_out.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkDescriptorBufferInfo dbi[4] = {
+        { m_buf_input.buffer,       0, m_buf_input.size },
+        { m_buf_diff_list.buffer,   0, m_buf_diff_list.size },
+        { m_buf_packet_meta.buffer, 0, m_buf_packet_meta.size },
+        { m_buf_packet_out.buffer,  0, m_buf_packet_out.size }
+    };
+
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = m_comp_desc_set;
+        writes[i].dstBinding = i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].descriptorCount = 1;
+        writes[i].pBufferInfo = &dbi[i];
+    }
+    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+}
+
+bool VulkanConverter::EnsurePacketBuffers(size_t max_capacity) {
+    bool updated = false;
+
+    // Allocate PacketMeta buffer (64 bytes for uint32 atomic counter)
+    if (m_buf_packet_meta.buffer == VK_NULL_HANDLE) {
+        size_t meta_size = 64;
+        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, meta_size,
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+        if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_packet_meta.buffer) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(m_device, m_buf_packet_meta.buffer, &req);
+        uint32_t memType = FindMemoryType(req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
+        if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_packet_meta.memory) != VK_SUCCESS) return false;
+        vkBindBufferMemory(m_device, m_buf_packet_meta.buffer, m_buf_packet_meta.memory, 0);
+        vkMapMemory(m_device, m_buf_packet_meta.memory, 0, meta_size, 0, &m_buf_packet_meta.mapped);
+        m_buf_packet_meta.size = meta_size;
+        updated = true;
+    }
+
+    // Allocate PacketOutput buffer (Host Cached for max read throughput)
+    if (m_buf_packet_out.size < max_capacity || m_buf_packet_out.buffer == VK_NULL_HANDLE) {
+        size_t alloc_size = std::max(max_capacity, size_t(36 * 1024 * 1024)); // Default to 36MB for 4K
+        DestroyBuffer(m_buf_packet_out);
+
+        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, alloc_size,
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+        if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_packet_out.buffer) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(m_device, m_buf_packet_out.buffer, &req);
+        uint32_t memType = FindMemoryType(req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
+        if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_packet_out.memory) != VK_SUCCESS) return false;
+        vkBindBufferMemory(m_device, m_buf_packet_out.buffer, m_buf_packet_out.memory, 0);
+        vkMapMemory(m_device, m_buf_packet_out.memory, 0, alloc_size, 0, &m_buf_packet_out.mapped);
+        m_buf_packet_out.size = alloc_size;
+        m_packet_capacity = alloc_size;
+        updated = true;
+    }
+
+    if (updated) {
+        UpdateCompDescriptors();
+    }
+    return true;
+}
+
+const uint8_t* VulkanConverter::GetMappedPacketBuffer() const {
+    return static_cast<const uint8_t*>(m_buf_packet_out.mapped);
+}
+
+const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
+    const uint8_t* curr_fb,
+    int fb_stride,
+    int width,
+    int height,
+    int tile_size,
+    uint32_t frame_index,
+    uint32_t& out_total_packet_bytes
+) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized) return nullptr;
+
+    uint32_t grid_cols = (width + tile_size - 1) / tile_size;
+    uint32_t grid_rows = (height + tile_size - 1) / tile_size;
+    uint32_t total_tiles = grid_cols * grid_rows;
+    size_t fb_size = static_cast<size_t>(fb_stride) * height;
+
+    if (!EnsureDiffBuffers(fb_size, total_tiles)) return nullptr;
+
+    size_t worst_case_bytes = 16 + static_cast<size_t>(total_tiles) * (14 + tile_size * tile_size * 4);
+    if (!EnsurePacketBuffers(worst_case_bytes)) return nullptr;
+
+    UpdateCompDescriptors();
+
+    if (curr_fb && curr_fb != m_buf_input.mapped) {
+        std::memcpy(m_buf_input.mapped, curr_fb, fb_size);
+    }
+
+    int stride_words = fb_stride / 4;
+    if (!DispatchTileDifferencing(width, height, stride_words, tile_size, true)) {
+        return nullptr;
+    }
+
+    uint32_t dirty_count = GetDirtyTileCount();
+    if (dirty_count == 0) {
+        out_total_packet_bytes = 0;
+        return nullptr;
+    }
+
+    // Record tile compression dispatch
+    vkResetCommandBuffer(m_cmd_buffer, 0);
+    VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
+                                           VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr };
+    if (vkBeginCommandBuffer(m_cmd_buffer, &beginInfo) != VK_SUCCESS) return nullptr;
+
+    // Reset total_packet_bytes in PacketMeta to 16 (reserving room for FrameSectionHeader)
+    vkCmdFillBuffer(m_cmd_buffer, m_buf_packet_meta.buffer, 0, sizeof(uint32_t), 16);
+
+    VkMemoryBarrier mb_clear = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+    vkCmdPipelineBarrier(m_cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_clear, 0, nullptr, 0, nullptr);
+
+    CompPushConstants pc = {
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        static_cast<uint32_t>(stride_words),
+        grid_cols,
+        grid_rows,
+        static_cast<uint32_t>(tile_size),
+        dirty_count
+    };
+
+    vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline);
+    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline_layout, 0, 1, &m_comp_desc_set, 0, nullptr);
+    vkCmdPushConstants(m_cmd_buffer, m_comp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    vkCmdDispatch(m_cmd_buffer, dirty_count, 1, 1);
+
+    VkMemoryBarrier mb_host = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_HOST_READ_BIT };
+    vkCmdPipelineBarrier(m_cmd_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb_host, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(m_cmd_buffer) != VK_SUCCESS) return nullptr;
+
+    vkResetFences(m_device, 1, &m_fence);
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_cmd_buffer, 0, nullptr };
+    if (vkQueueSubmit(m_compute_queue, 1, &submitInfo, m_fence) != VK_SUCCESS) return nullptr;
+    if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return nullptr;
+
+    // Invalidate mapped memory to guarantee CPU cache coherency
+    VkMappedMemoryRange ranges[2] = {};
+    ranges[0].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    ranges[0].memory = m_buf_packet_meta.memory;
+    ranges[0].offset = 0;
+    ranges[0].size = VK_WHOLE_SIZE;
+    ranges[1].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    ranges[1].memory = m_buf_packet_out.memory;
+    ranges[1].offset = 0;
+    ranges[1].size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(m_device, 2, ranges);
+
+    out_total_packet_bytes = *reinterpret_cast<volatile uint32_t*>(m_buf_packet_meta.mapped);
+
+    // Write 16-byte FrameSectionHeader at start of packet buffer
+    protocol::FrameSectionHeader frame_hdr = {};
+    frame_hdr.magic         = protocol::DL_FRAME_MAGIC;
+    frame_hdr.frame_index   = frame_index;
+    frame_hdr.screen_width  = static_cast<uint16_t>(width);
+    frame_hdr.screen_height = static_cast<uint16_t>(height);
+    frame_hdr.tile_count    = static_cast<uint16_t>(dirty_count);
+    frame_hdr.head_id       = 0;
+    frame_hdr.reserved      = 0;
+
+    std::memcpy(m_buf_packet_out.mapped, &frame_hdr, sizeof(frame_hdr));
+
+    VkMappedMemoryRange flush_range = {};
+    flush_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    flush_range.memory = m_buf_packet_out.memory;
+    flush_range.offset = 0;
+    flush_range.size = sizeof(frame_hdr);
+    vkFlushMappedMemoryRanges(m_device, 1, &flush_range);
+
+    return static_cast<const uint8_t*>(m_buf_packet_out.mapped);
 }
 
 } // namespace dl_turbo

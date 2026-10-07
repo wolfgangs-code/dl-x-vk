@@ -1,4 +1,5 @@
 #include "service.hpp"
+#include "vulkan_converter.hpp"
 #include <chrono>
 
 namespace dl_turbo {
@@ -134,11 +135,26 @@ void DisplayLinkService::OnFrameReady(
 
     m_frame_counter++;
 
-    // 1. Coalesce dirty rectangles and tile them
+    // Fast Path: End-to-End GPU Temporal Differencing and Parallel Tile Compression
+    auto& vk = VulkanConverter::Instance();
+    if (vk.IsAvailable()) {
+        uint32_t total_packet_bytes = 0;
+        const uint8_t* packet_data = vk.EncodeFramePacketsGpu(
+            fb_data, stride, width, height, 32, m_frame_counter, total_packet_bytes
+        );
+
+        if (packet_data && total_packet_bytes > sizeof(protocol::FrameSectionHeader)) {
+            if (m_usb && m_usb->IsConnected()) {
+                m_usb->SendVideoData(protocol::EP_VIDEO_HEAD0, packet_data, total_packet_bytes);
+            }
+        }
+        return;
+    }
+
+    // Fallback Path: CPU SIMD differencing and CPU RLE compression
     auto merged_rects = TileEngine::CoalesceRects(dirty_rects);
     auto candidate_tiles = m_tile_engine->GenerateDirtyTiles(merged_rects);
 
-    // 2. Filter out unchanged tiles using fast hardware CRC32/SIMD differencing
     auto dirty_tiles = m_tile_engine->FilterChangedTiles(fb_data, stride, candidate_tiles);
     if (dirty_tiles.empty()) return;
 

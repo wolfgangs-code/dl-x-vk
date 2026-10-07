@@ -75,9 +75,21 @@ public:
         bool update_reference
     );
 
+    // GPU-accelerated parallel tile compression directly into DisplayLink USB packet format
+    const uint8_t* EncodeFramePacketsGpu(
+        const uint8_t* curr_fb,
+        int fb_stride,
+        int width,
+        int height,
+        int tile_size,
+        uint32_t frame_index,
+        uint32_t& out_total_packet_bytes
+    );
+
     uint32_t GetDirtyTileCount() const;
     const uint32_t* GetDirtyTileIndices() const;
     const uint32_t* GetDirtyBitmask() const;
+    const uint8_t* GetMappedPacketBuffer() const;
 
     ~VulkanConverter();
 
@@ -88,6 +100,8 @@ private:
 
     bool EnsureBuffers(size_t src_size, size_t y_size, size_t uv_size);
     bool EnsureDiffBuffers(size_t fb_size, uint32_t total_tiles);
+    bool EnsurePacketBuffers(size_t max_capacity);
+    void UpdateCompDescriptors();
     void DestroyBuffer(VulkanBuffer& buf);
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags required);
 
@@ -117,21 +131,32 @@ private:
     VkDescriptorPool m_diff_desc_pool = VK_NULL_HANDLE;
     VkDescriptorSet m_diff_desc_set = VK_NULL_HANDLE;
 
+    // Tile compression pipeline
+    VkShaderModule m_comp_shader_module = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_comp_desc_layout = VK_NULL_HANDLE;
+    VkPipelineLayout m_comp_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline m_comp_pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool m_comp_desc_pool = VK_NULL_HANDLE;
+    VkDescriptorSet m_comp_desc_set = VK_NULL_HANDLE;
+
     VkCommandPool m_cmd_pool = VK_NULL_HANDLE;
     VkCommandBuffer m_cmd_buffer = VK_NULL_HANDLE;
     VkFence m_fence = VK_NULL_HANDLE;
 
-    // Color conversion buffers
+    // Buffers
     VulkanBuffer m_buf_input;
     VulkanBuffer m_buf_y;
     VulkanBuffer m_buf_u;
     VulkanBuffer m_buf_v;
 
-    // Tile differencing buffers
     VulkanBuffer m_buf_diff_ref;   // Previous frame stored in GPU Device Local memory
     VulkanBuffer m_buf_diff_mask;  // 1-bit per tile dirty bitmask
     VulkanBuffer m_buf_diff_list;  // Atomic dirty count + uint32 dirty tile indices
     uint32_t m_diff_total_tiles = 0;
+
+    VulkanBuffer m_buf_packet_meta; // uint32 total_packet_bytes atomic counter
+    VulkanBuffer m_buf_packet_out;  // Contiguous USB packet payload (Host-Cached)
+    size_t m_packet_capacity = 0;
 };
 
 } // namespace dl_turbo

@@ -1,0 +1,189 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 32, local_size_y = 1) in; // 32 threads = 1 thread per row of 32x32 macro-tile
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint stride_words;
+    uint grid_cols;
+    uint grid_rows;
+    uint tile_size;
+    uint dirty_tile_count;
+} pc;
+
+layout(std430, binding = 0) readonly buffer CurrentFrame {
+    uint curr_pixels[];
+};
+
+layout(std430, binding = 1) readonly buffer DirtyList {
+    uint in_dirty_count;
+    uint dirty_tile_ids[];
+};
+
+layout(std430, binding = 2) buffer PacketMeta {
+    uint total_packet_bytes;
+};
+
+layout(std430, binding = 3) writeonly buffer PacketOutput {
+    uint8_t packet_data[];
+};
+
+shared uint s_row_comp[32 * 40]; // 32 rows * 40 uints = up to 160 bytes per compressed row
+shared uint s_row_len[32];
+shared uint s_row_offset[32];
+shared uint s_tile_payload_len;
+shared uint s_out_pos;
+shared uint s_comp_type;
+
+void main() {
+    uint workgroup_id = gl_WorkGroupID.x;
+    if (workgroup_id >= pc.dirty_tile_count) return;
+
+    uint tile_id = dirty_tile_ids[workgroup_id];
+    uint col = tile_id % pc.grid_cols;
+    uint row = tile_id / pc.grid_cols;
+
+    uint tile_x = col * pc.tile_size;
+    uint tile_y = row * pc.tile_size;
+    uint tile_w = min(pc.tile_size, pc.width - tile_x);
+    uint tile_h = min(pc.tile_size, pc.height - tile_y);
+
+    uint r = gl_LocalInvocationID.x; // Row index 0..31 within the tile
+
+    // RLE Compress row r
+    if (r < tile_h) {
+        uint row_gy = tile_y + r;
+        uint src_offset = row_gy * pc.stride_words + tile_x;
+
+        uint row_bytes = tile_w * 4;
+        uint src_idx = 0;
+        uint dst_idx = 0;
+        uint row_buf_base = r * 40;
+
+        while (src_idx < row_bytes && dst_idx + 3 < 160) {
+            uint word = curr_pixels[src_offset + (src_idx >> 2)];
+            uint byte_val = (word >> ((src_idx & 3u) * 8u)) & 0xFFu;
+            uint count = 1;
+
+            while (src_idx + count < row_bytes && count < 255) {
+                uint next_word = curr_pixels[src_offset + ((src_idx + count) >> 2)];
+                uint next_byte = (next_word >> (((src_idx + count) & 3u) * 8u)) & 0xFFu;
+                if (next_byte != byte_val) break;
+                count++;
+            }
+
+            if (count > 3 || byte_val == 0x55u) {
+                // DL escape sequence: 0x55, count, byte_val
+                uint b0 = 0x55u;
+                uint b1 = count;
+                uint b2 = byte_val;
+
+                uint w_idx = dst_idx >> 2;
+                uint b_idx = dst_idx & 3u;
+                s_row_comp[row_buf_base + w_idx] = (s_row_comp[row_buf_base + w_idx] & ~(0xFFu << (b_idx * 8u))) | (b0 << (b_idx * 8u));
+                dst_idx++;
+
+                w_idx = dst_idx >> 2;
+                b_idx = dst_idx & 3u;
+                s_row_comp[row_buf_base + w_idx] = (s_row_comp[row_buf_base + w_idx] & ~(0xFFu << (b_idx * 8u))) | (b1 << (b_idx * 8u));
+                dst_idx++;
+
+                w_idx = dst_idx >> 2;
+                b_idx = dst_idx & 3u;
+                s_row_comp[row_buf_base + w_idx] = (s_row_comp[row_buf_base + w_idx] & ~(0xFFu << (b_idx * 8u))) | (b2 << (b_idx * 8u));
+                dst_idx++;
+
+                src_idx += count;
+            } else {
+                uint w_idx = dst_idx >> 2;
+                uint b_idx = dst_idx & 3u;
+                s_row_comp[row_buf_base + w_idx] = (s_row_comp[row_buf_base + w_idx] & ~(0xFFu << (b_idx * 8u))) | (byte_val << (b_idx * 8u));
+                dst_idx++;
+                src_idx++;
+            }
+        }
+        s_row_len[r] = dst_idx;
+    } else {
+        s_row_len[r] = 0;
+    }
+
+    barrier();
+
+    // Thread 0 aggregates lengths and reserves packet output position
+    if (r == 0) {
+        uint total_comp = 0;
+        for (uint i = 0; i < tile_h; ++i) {
+            s_row_offset[i] = total_comp;
+            total_comp += s_row_len[i];
+        }
+
+        uint raw_bytes = tile_w * tile_h * 4;
+        if (total_comp > 0 && total_comp < (raw_bytes * 85 / 100)) {
+            s_comp_type = 1u; // RunLengthDL1
+            s_tile_payload_len = total_comp;
+        } else {
+            s_comp_type = 0u; // RawUncompressed
+            s_tile_payload_len = raw_bytes;
+        }
+
+        // Reserve 14 bytes for TileDescriptorHeader + compressed payload in output buffer
+        s_out_pos = atomicAdd(total_packet_bytes, 14 + s_tile_payload_len);
+    }
+
+    barrier();
+
+    // Thread 0 writes the 14-byte packed TileDescriptorHeader
+    if (r == 0) {
+        uint pos = s_out_pos;
+        // x (uint16)
+        packet_data[pos + 0] = uint8_t(tile_x & 0xFFu);
+        packet_data[pos + 1] = uint8_t((tile_x >> 8u) & 0xFFu);
+        // y (uint16)
+        packet_data[pos + 2] = uint8_t(tile_y & 0xFFu);
+        packet_data[pos + 3] = uint8_t((tile_y >> 8u) & 0xFFu);
+        // width (uint16)
+        packet_data[pos + 4] = uint8_t(tile_w & 0xFFu);
+        packet_data[pos + 5] = uint8_t((tile_w >> 8u) & 0xFFu);
+        // height (uint16)
+        packet_data[pos + 6] = uint8_t(tile_h & 0xFFu);
+        packet_data[pos + 7] = uint8_t((tile_h >> 8u) & 0xFFu);
+        // compression (uint8: 0x00=Raw, 0x01=RLE)
+        packet_data[pos + 8] = uint8_t(s_comp_type);
+        // flags (uint8: bit 0 = lossless)
+        packet_data[pos + 9] = uint8_t(0x01);
+        // compressed_bytes (uint32)
+        packet_data[pos + 10] = uint8_t(s_tile_payload_len & 0xFFu);
+        packet_data[pos + 11] = uint8_t((s_tile_payload_len >> 8u) & 0xFFu);
+        packet_data[pos + 12] = uint8_t((s_tile_payload_len >> 16u) & 0xFFu);
+        packet_data[pos + 13] = uint8_t((s_tile_payload_len >> 24u) & 0xFFu);
+    }
+
+    // Parallel write payload across the 32 threads
+    if (s_comp_type == 1u) {
+        if (r < tile_h) {
+            uint dest_base = s_out_pos + 14 + s_row_offset[r];
+            uint len = s_row_len[r];
+            uint row_buf_base = r * 40;
+            for (uint i = 0; i < len; ++i) {
+                uint w = s_row_comp[row_buf_base + (i >> 2)];
+                packet_data[dest_base + i] = uint8_t((w >> ((i & 3u) * 8u)) & 0xFFu);
+            }
+        }
+    } else {
+        if (r < tile_h) {
+            uint dest_base = s_out_pos + 14 + r * (tile_w * 4);
+            uint row_gy = tile_y + r;
+            uint src_offset = row_gy * pc.stride_words + tile_x;
+            for (uint px = 0; px < tile_w; ++px) {
+                uint word = curr_pixels[src_offset + px];
+                packet_data[dest_base + px * 4 + 0] = uint8_t(word & 0xFFu);
+                packet_data[dest_base + px * 4 + 1] = uint8_t((word >> 8u) & 0xFFu);
+                packet_data[dest_base + px * 4 + 2] = uint8_t((word >> 16u) & 0xFFu);
+                packet_data[dest_base + px * 4 + 3] = uint8_t((word >> 24u) & 0xFFu);
+            }
+        }
+    }
+}

@@ -54,9 +54,10 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 | Subsystem / Kernel | 4K Throughput | Latency / Frame | CPU Overhead |
 |:---|:---:|:---:|:---:|
-| **Vulkan GPU Tile Differencing (8,160 Tiles)** | **284+ Passes/s** | **~3.52 ms** | **~0% (GPU Compute)** |
-| **Vulkan GPU Color Conversion (Zero-Copy)** | **297–320 FPS** | **~3.36 ms** | **~0% (GPU Compute)** |
-| **Vulkan End-to-End Frame Pipeline** | **83.7 FPS** | **~11.9 ms** | Minimal |
+| **Vulkan GPU Tile Differencing (8,160 Tiles)** | **330–355 Passes/s** | **~2.82 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Tile Compression (Wire Packet Stream)** | **100+ FPS** | **~9.98 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Color Conversion (Zero-Copy)** | **297–327 FPS** | **~3.05 ms** | **~0% (GPU Compute)** |
+| **Vulkan End-to-End Frame Pipeline** | **85.1 FPS** | **~11.7 ms** | Minimal |
 | **AVX2 SIMD Color Conversion** | 100+ FPS | ~9.9 ms | 100% Core Load |
 | **Original Scalar Reference** | ~18 FPS | ~55.0 ms | 100% Core Load |
 
@@ -66,10 +67,11 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 ## Features
 
-* **Vulkan SPIR-V Compute Acceleration**: Offloads the entire ITU-R BT.601 RGB32-to-planar-YUV420 color space conversion directly to GPU compute units using host-visible/device-local memory, eliminating CPU bottlenecks.
-* **Graceful Multi-Tier Fallback**: Automatically falls back to AVX2 SIMD instructions or scalar CPU paths if Vulkan compute is unavailable.
-* **Temporal Macro-Tile Differencing**: Hardware SSE4.2 / CRC32 differencing filters unchanged tiles to drastically reduce USB transmission bandwidth.
-* **Zero-Copy Architecture**: Uses host-coherent mapped storage buffers (SSBOs) with cached readback for optimal APU and discrete GPU memory bandwidth.
+* **End-to-End GPU Pipeline**: Zero CPU-to-GPU and GPU-to-CPU uncompressed frame swaps. The frame stays in GPU memory for differencing and compression.
+* **GPU Parallel Tile Compression**: Compresses dirty $32 \times 32$ macro-tiles directly on the GPU in parallel into DisplayLink DL1/DL3 USB packet format using atomic byte reservation, writing output directly into a host-cached packet buffer.
+* **Vulkan SPIR-V Compute Acceleration**: Offloads ITU-R BT.601 RGB32-to-planar-YUV420 color space conversion directly to GPU compute units using host-visible/device-local memory, eliminating CPU bottlenecks.
+* **GPU Temporal Macro-Tile Differencing**: Compares entire 4K display frames against reference frames on GPU in ~2.8 ms, isolating dirty tiles with zero CPU intervention.
+* **Graceful Multi-Tier Fallback**: Automatically falls back to SSE4.2 CRC32 differencing, AVX2 SIMD instructions, or scalar CPU paths if Vulkan compute is unavailable.
 * **Clean-Room Open Source**: 100% C++20 implementation under the MIT License without proprietary binary blobs.
 
 ---

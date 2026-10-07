@@ -83,6 +83,37 @@ void RunBenchmark() {
         LOG_INFO("[Vulkan GPU Temporal Tile Differencing (8,160 4K Tiles)]");
         LOG_INFO("  Processed %d 4K diff passes in %.2f ms", FRAMES, diff_ms);
         LOG_INFO("  Diff Throughput: %.2f Passes/sec (%.2f ms/pass)", (FRAMES * 1000.0) / diff_ms, diff_ms / FRAMES);
+
+        // 4. GPU Tile Compression & USB Wire Packet Packaging
+        for (size_t i = 0; i < rgb_buffer.size(); i += 128) {
+            rgb_buffer[i] ^= 0x55;
+        }
+        uint32_t total_packet_bytes = 0;
+        const uint8_t* pkt = vk.EncodeFramePacketsGpu(rgb_buffer.data(), WIDTH * 4, WIDTH, HEIGHT, 32, 1, total_packet_bytes);
+        if (pkt && total_packet_bytes > sizeof(dl_turbo::protocol::FrameSectionHeader)) {
+            const auto* hdr = reinterpret_cast<const dl_turbo::protocol::FrameSectionHeader*>(pkt);
+            LOG_INFO("[Vulkan GPU Tile Compression (Wire Packet Stream)]");
+            LOG_INFO("  Full 4K Keyframe: %u dirty tiles -> %u KB packet (DLFR magic: 0x%08X)",
+                     hdr->tile_count, total_packet_bytes / 1024, hdr->magic);
+        }
+
+        // Benchmark incremental update: modify 100 tiles per frame
+        const int DIRTY_BENCH_PASSES = 50;
+        auto start_comp = std::chrono::high_resolution_clock::now();
+        for (int p = 0; p < DIRTY_BENCH_PASSES; ++p) {
+            // Touch 100 tiles across the screen
+            for (int t = 0; t < 100; ++t) {
+                int px = (t * 32) % WIDTH;
+                int py = ((t * 32) / WIDTH) * 32;
+                rgb_buffer[(py * WIDTH + px) * 4] ^= static_cast<uint8_t>(p + 1);
+            }
+            vk.EncodeFramePacketsGpu(rgb_buffer.data(), WIDTH * 4, WIDTH, HEIGHT, 32, p + 2, total_packet_bytes);
+        }
+        auto end_comp = std::chrono::high_resolution_clock::now();
+        double comp_ms = std::chrono::duration<double, std::milli>(end_comp - start_comp).count();
+
+        LOG_INFO("  Incremental Update (100 Dirty Tiles): %d passes in %.2f ms", DIRTY_BENCH_PASSES, comp_ms);
+        LOG_INFO("  Throughput: %.2f FPS (%.2f ms/frame)", (DIRTY_BENCH_PASSES * 1000.0) / comp_ms, comp_ms / DIRTY_BENCH_PASSES);
     }
 
     // Verify sample output values
