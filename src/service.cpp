@@ -157,7 +157,10 @@ void DisplayLinkService::OnFrameReady(
 
         if (packet_data && total_packet_bytes > sizeof(protocol::FrameSectionHeader)) {
             if (m_usb && m_usb->IsConnected()) {
-                m_usb->SendVideoData(protocol::EP_VIDEO_HEAD0, packet_data, total_packet_bytes);
+                int comp_slot = vk.GetCompletedSlot();
+                m_usb->SendVideoDataZeroCopy(
+                    protocol::EP_VIDEO_HEAD0, packet_data, total_packet_bytes, vk.GetPacketCompletionFlag(comp_slot)
+                );
             }
         }
         return;

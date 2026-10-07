@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <mutex>
+#include <atomic>
 #include <vulkan/vulkan.h>
 #include "tile_engine.hpp"
 
@@ -100,6 +101,12 @@ public:
     const uint32_t* GetDirtyBitmask() const;
     const uint8_t* GetMappedPacketBuffer() const;
 
+    std::atomic<bool>* GetPacketCompletionFlag(int slot) {
+        if (slot < 0 || slot >= 2) return nullptr;
+        return &m_packet_usb_in_flight[slot];
+    }
+    int GetCompletedSlot() const { return m_last_completed_slot; }
+
     ~VulkanConverter();
 
 private:
@@ -170,6 +177,8 @@ private:
 
     // Asynchronous double-buffered pipelining state
     int m_in_flight_slot = -1;
+    int m_last_completed_slot = -1;
+    std::atomic<bool> m_packet_usb_in_flight[2];
     uint32_t m_in_flight_frame_index = 0;
     int m_in_flight_width = 0;
     int m_in_flight_height = 0;

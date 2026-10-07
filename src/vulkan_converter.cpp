@@ -3,6 +3,7 @@
 #include "protocol.hpp"
 #include <cstring>
 #include <algorithm>
+#include <thread>
 
 namespace dl_turbo {
 
@@ -54,6 +55,8 @@ VulkanConverter& VulkanConverter::Instance() {
 }
 
 VulkanConverter::VulkanConverter() {
+    m_packet_usb_in_flight[0].store(false);
+    m_packet_usb_in_flight[1].store(false);
     Initialize();
 }
 
@@ -1100,6 +1103,7 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
 
                 ret_packet = static_cast<const uint8_t*>(m_buf_packet_out[comp_slot].mapped);
                 out_total_packet_bytes = comp_packet_bytes;
+                m_last_completed_slot = comp_slot;
             }
         }
         m_in_flight = false;
@@ -1188,6 +1192,11 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     // Wait on slot fence before recording to guarantee GPU is done with previous frame on this slot
     vkWaitForFences(m_device, 1, &m_fence[slot], VK_TRUE, UINT64_MAX);
     vkResetFences(m_device, 1, &m_fence[slot]);
+
+    // Ensure any in-flight asynchronous zero-copy USB DMA transfer on this slot has completed
+    while (m_packet_usb_in_flight[slot].load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 
     if (curr_fb != m_buf_input[slot].mapped && curr_fb) {
         if (use_multi_dispatch) {
@@ -1426,6 +1435,7 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     flush_range.size = sizeof(frame_hdr);
     vkFlushMappedMemoryRanges(m_device, 1, &flush_range);
 
+    m_last_completed_slot = slot;
     return static_cast<const uint8_t*>(m_buf_packet_out[slot].mapped);
 }
 
@@ -1480,6 +1490,7 @@ const uint8_t* VulkanConverter::FlushFramePacketsGpu(uint32_t& out_total_packet_
 
         ret_packet = static_cast<const uint8_t*>(m_buf_packet_out[comp_slot].mapped);
         out_total_packet_bytes = comp_packet_bytes;
+        m_last_completed_slot = comp_slot;
     }
     m_in_flight = false;
     return ret_packet;

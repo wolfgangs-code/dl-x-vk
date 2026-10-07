@@ -47,6 +47,15 @@ public:
     // Send bulk video frame slice data over video endpoint (EP 8 or EP 10) asynchronously via Multi-URB ring queue
     bool SendVideoData(uint8_t endpoint, const uint8_t* data, size_t length, unsigned int timeout_ms = 1000);
 
+    // Send bulk video frame slice data over video endpoint asynchronously (Zero-Copy direct pointer)
+    bool SendVideoDataZeroCopy(
+        uint8_t endpoint,
+        const uint8_t* data,
+        size_t length,
+        std::atomic<bool>* completion_flag = nullptr,
+        unsigned int timeout_ms = 1000
+    );
+
     // Synchronous fallback for sending video data
     bool SendVideoDataSync(uint8_t endpoint, const uint8_t* data, size_t length, unsigned int timeout_ms = 1000);
 
@@ -54,7 +63,7 @@ public:
     bool FlushVideoTransfers(unsigned int timeout_ms = 1000);
 
     // Benchmark ring buffer dispatch latency and memory queuing overhead
-    double BenchmarkRingDispatch(const uint8_t* data, size_t length, int iterations = 100);
+    double BenchmarkRingDispatch(const uint8_t* data, size_t length, int iterations = 100, bool zero_copy = false);
 
     // Send keepalive heartbeat
     bool SendHeartbeat(uint8_t head_id = 0);
@@ -68,8 +77,10 @@ private:
         libusb_transfer* transfer{nullptr};
         std::vector<uint8_t> buffer;
         std::atomic<bool> in_flight{false};
+        std::atomic<bool>* completion_flag{nullptr};
         UsbTransport* transport{nullptr};
         uint32_t urb_id{0};
+        bool is_zero_copy{false};
     };
 
     void EventThreadLoop();

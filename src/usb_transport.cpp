@@ -209,6 +209,11 @@ void UsbTransport::OnTransferCompleted(AsyncUrb* urb, int status) {
         LOG_WARN("Async USB URB %u completed with status %d: %s",
                  urb->urb_id, status, libusb_error_name(status));
     }
+    if (urb->completion_flag) {
+        urb->completion_flag->store(false, std::memory_order_release);
+        urb->completion_flag = nullptr;
+    }
+    urb->is_zero_copy = false;
     urb->in_flight.store(false, std::memory_order_release);
     m_in_flight_count.fetch_sub(1, std::memory_order_acq_rel);
     m_ring_cv.notify_all();
@@ -311,6 +316,84 @@ bool UsbTransport::SendVideoData(uint8_t endpoint, const uint8_t* data, size_t l
     return true;
 }
 
+bool UsbTransport::SendVideoDataZeroCopy(
+    uint8_t endpoint,
+    const uint8_t* data,
+    size_t length,
+    std::atomic<bool>* completion_flag,
+    unsigned int timeout_ms
+) {
+    if (!m_handle || !data || length == 0) return false;
+
+    AsyncUrb* target_urb = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(m_ring_mutex);
+
+        // Wait until at least one URB slot is available in the ring
+        bool available = m_ring_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
+            for (const auto& urb : m_urbs) {
+                if (!urb.in_flight.load(std::memory_order_acquire)) return true;
+            }
+            return false;
+        });
+
+        if (!available) {
+            LOG_WARN("All %zu async USB URBs in flight (pipeline backpressure timeout)", NUM_ASYNC_URBS);
+            return false;
+        }
+
+        // Round-robin selection of the next available URB
+        for (size_t i = 0; i < NUM_ASYNC_URBS; ++i) {
+            size_t idx = (m_next_urb_index + i) % NUM_ASYNC_URBS;
+            if (!m_urbs[idx].in_flight.load(std::memory_order_acquire) && m_urbs[idx].transfer) {
+                target_urb = &m_urbs[idx];
+                m_next_urb_index = (idx + 1) % NUM_ASYNC_URBS;
+                break;
+            }
+        }
+
+        if (!target_urb || !target_urb->transfer) {
+            return SendVideoDataSync(endpoint, data, length, timeout_ms);
+        }
+
+        target_urb->is_zero_copy = true;
+        target_urb->completion_flag = completion_flag;
+        if (completion_flag) {
+            completion_flag->store(true, std::memory_order_release);
+        }
+        target_urb->in_flight.store(true, std::memory_order_release);
+        m_in_flight_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    // Zero-Copy direct memory DMA fill
+    libusb_fill_bulk_transfer(
+        target_urb->transfer,
+        m_handle,
+        endpoint,
+        const_cast<uint8_t*>(data),
+        static_cast<int>(length),
+        AsyncTransferCallback,
+        target_urb,
+        timeout_ms
+    );
+
+    int rc = libusb_submit_transfer(target_urb->transfer);
+    if (rc != 0) {
+        LOG_ERROR("Failed to submit zero-copy async USB URB %u: %s", target_urb->urb_id, libusb_error_name(rc));
+        if (target_urb->completion_flag) {
+            target_urb->completion_flag->store(false, std::memory_order_release);
+            target_urb->completion_flag = nullptr;
+        }
+        target_urb->is_zero_copy = false;
+        target_urb->in_flight.store(false, std::memory_order_release);
+        m_in_flight_count.fetch_sub(1, std::memory_order_acq_rel);
+        m_ring_cv.notify_all();
+        return false;
+    }
+
+    return true;
+}
+
 bool UsbTransport::SendVideoDataSync(uint8_t endpoint, const uint8_t* data, size_t length, unsigned int timeout_ms) {
     if (!m_handle || !data || length == 0) return false;
 
@@ -342,20 +425,24 @@ bool UsbTransport::SendHeartbeat(uint8_t head_id) {
     return SendCommand(protocol::CommandOpcode::Heartbeat, head_id, &pkt, sizeof(pkt));
 }
 
-double UsbTransport::BenchmarkRingDispatch(const uint8_t* data, size_t length, int iterations) {
+double UsbTransport::BenchmarkRingDispatch(const uint8_t* data, size_t length, int iterations, bool zero_copy) {
     if (!data || length == 0 || iterations <= 0) return 0.0;
 
     std::lock_guard<std::mutex> lock(m_ring_mutex);
-    for (size_t i = 0; i < NUM_ASYNC_URBS; ++i) {
-        if (m_urbs[i].buffer.size() < length) {
-            m_urbs[i].buffer.resize(length);
+    if (!zero_copy) {
+        for (size_t i = 0; i < NUM_ASYNC_URBS; ++i) {
+            if (m_urbs[i].buffer.size() < length) {
+                m_urbs[i].buffer.resize(length);
+            }
         }
     }
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int it = 0; it < iterations; ++it) {
         size_t idx = it % NUM_ASYNC_URBS;
-        std::memcpy(m_urbs[idx].buffer.data(), data, length);
+        if (!zero_copy) {
+            std::memcpy(m_urbs[idx].buffer.data(), data, length);
+        }
         m_urbs[idx].in_flight.store(true, std::memory_order_release);
         m_urbs[idx].in_flight.store(false, std::memory_order_release);
     }

@@ -215,16 +215,18 @@ void RunBenchmark() {
                      multi_fps / union_fps, (union_ms - multi_ms) / MULTI_PASSES);
         }
 
-        // 6. USB Transport Layer Pipeline Evaluation (Synchronous vs Async Multi-URB Ring Queue)
-        LOG_INFO("[USB Transport Pipeline (Asynchronous Multi-URB Ring Queue)]");
+        // 6. USB Transport Layer Pipeline Evaluation (Synchronous vs Async Multi-URB Ring Queue vs Zero-Copy DMA)
+        LOG_INFO("[USB Transport Pipeline (Asynchronous Multi-URB Ring Queue & Zero-Copy DMA)]");
         dl_turbo::UsbTransport usb_bench;
 
         // Keyframe payload (1,124 KB) and incremental packet (~25 KB)
         std::vector<uint8_t> key_payload(1124 * 1024, 0xAA);
         std::vector<uint8_t> inc_payload(25 * 1024, 0x55);
 
-        double async_key_us = usb_bench.BenchmarkRingDispatch(key_payload.data(), key_payload.size(), 100);
-        double async_inc_us = usb_bench.BenchmarkRingDispatch(inc_payload.data(), inc_payload.size(), 100);
+        double copy_key_us = usb_bench.BenchmarkRingDispatch(key_payload.data(), key_payload.size(), 100, false);
+        double zc_key_us   = usb_bench.BenchmarkRingDispatch(key_payload.data(), key_payload.size(), 100, true);
+        double copy_inc_us = usb_bench.BenchmarkRingDispatch(inc_payload.data(), inc_payload.size(), 100, false);
+        double zc_inc_us   = usb_bench.BenchmarkRingDispatch(inc_payload.data(), inc_payload.size(), 100, true);
 
         // Theoretical synchronous wait times: USB 3.0 SuperSpeed payload @ 420 MB/s + host controller ACK
         double sync_key_ms = (static_cast<double>(key_payload.size()) / (420.0 * 1024.0 * 1024.0)) * 1000.0 + 0.35;
@@ -232,13 +234,15 @@ void RunBenchmark() {
 
         LOG_INFO("  Incremental Update (25 KB Packet):");
         LOG_INFO("    Synchronous Bulk Transfer Blocking Stall:  %.2f ms (Thread suspended waiting for USB ACK)", sync_inc_ms);
-        LOG_INFO("    Asynchronous Multi-URB Dispatch Latency:   %.2f µs (%.4f ms)", async_inc_us, async_inc_us / 1000.0);
-        LOG_INFO("    Thread Stall Elimination:                  %.1fx speedup (Non-blocking queue)", (sync_inc_ms * 1000.0) / async_inc_us);
+        LOG_INFO("    Buffered Async Multi-URB Dispatch:         %.2f µs (%.4f ms)", copy_inc_us, copy_inc_us / 1000.0);
+        LOG_INFO("    Zero-Copy Direct Pointer DMA Dispatch:     %.2f µs (%.4f ms) (%.1fx faster)", zc_inc_us, zc_inc_us / 1000.0, copy_inc_us / zc_inc_us);
+        LOG_INFO("    Thread Stall Elimination:                  %.1fx speedup (Non-blocking queue)", (sync_inc_ms * 1000.0) / zc_inc_us);
 
         LOG_INFO("  Full 4K Keyframe (1,124 KB Packet):");
         LOG_INFO("    Synchronous Bulk Transfer Blocking Stall:  %.2f ms (Thread suspended waiting for wire transmission)", sync_key_ms);
-        LOG_INFO("    Asynchronous Multi-URB Dispatch Latency:   %.2f µs (%.4f ms)", async_key_us, async_key_us / 1000.0);
-        LOG_INFO("    Thread Stall Elimination:                  %.1fx speedup (Pipelined DMA streaming)", (sync_key_ms * 1000.0) / async_key_us);
+        LOG_INFO("    Buffered Async Multi-URB Dispatch:         %.2f µs (%.4f ms memcpy stall)", copy_key_us, copy_key_us / 1000.0);
+        LOG_INFO("    Zero-Copy Direct Pointer DMA Dispatch:     %.2f µs (%.4f ms) (%.1fx faster, 0 ms memcpy!)", zc_key_us, zc_key_us / 1000.0, copy_key_us / zc_key_us);
+        LOG_INFO("    Thread Stall Elimination:                  %.1fx speedup (Zero-Copy Pipelined DMA streaming)", (sync_key_ms * 1000.0) / zc_key_us);
         LOG_INFO("  Ring Queue Architecture: %zu Active Asynchronous URBs (Zero Idle Bubbles)", dl_turbo::UsbTransport::NUM_ASYNC_URBS);
 
         // 7. Dual-4K (Dual Head 2x 3840x2160 @ 60Hz) Workload Evaluation
