@@ -1,4 +1,5 @@
 #include "evdi_device.hpp"
+#include "vulkan_converter.hpp"
 #include "common.hpp"
 #include <unistd.h>
 #include <sys/select.h>
@@ -98,17 +99,35 @@ void EvdiDevice::AllocateBuffers(int width, int height) {
 
     LOG_INFO("Allocating double buffers: %dx%d (stride=%d, size=%zu)", width, height, stride, size);
 
+    auto& vk = VulkanConverter::Instance();
+    bool use_vk = vk.IsAvailable();
+
     m_buffers.resize(2);
     for (int i = 0; i < 2; ++i) {
         m_buffers[i].id = i;
         m_buffers[i].width = width;
         m_buffers[i].height = height;
         m_buffers[i].stride = stride;
-        m_buffers[i].memory.resize(size, 0);
+
+        uint8_t* ptr = nullptr;
+        if (use_vk) {
+            ptr = vk.GetMappedInputBuffer(i, size);
+        }
+
+        if (ptr) {
+            m_buffers[i].external = true;
+            m_buffers[i].data_ptr = ptr;
+            m_buffers[i].memory.clear();
+            LOG_INFO("EVDI Buffer %d registered directly to Vulkan mapped GPU buffer (Zero-Copy)", i);
+        } else {
+            m_buffers[i].external = false;
+            m_buffers[i].memory.resize(size, 0);
+            m_buffers[i].data_ptr = m_buffers[i].memory.data();
+        }
 
         struct evdi_buffer buf;
         buf.id = i;
-        buf.buffer = m_buffers[i].memory.data();
+        buf.buffer = m_buffers[i].data_ptr;
         buf.width = width;
         buf.height = height;
         buf.stride = stride;
@@ -205,7 +224,7 @@ void EvdiDevice::UpdateReadyHandler(int buffer_id, void* user_data) {
 
     if (self->m_frame_cb) {
         const auto& fb = self->m_buffers[buffer_id];
-        self->m_frame_cb(buffer_id, fb.memory.data(), fb.width, fb.height, fb.stride, dirty);
+        self->m_frame_cb(buffer_id, fb.data_ptr, fb.width, fb.height, fb.stride, dirty);
     }
 
     // Request next buffer flip (double buffering swap)

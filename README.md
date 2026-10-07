@@ -54,11 +54,12 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 | Subsystem / Kernel | 4K Throughput | Latency / Frame | CPU Overhead |
 |:---|:---:|:---:|:---:|
-| **Vulkan Clipped Dirty Incremental Update (100 Tiles)** | **658–736+ FPS** | **~1.36 ms** | **~0% (GPU Compute)** |
-| **Vulkan GPU Compute Kernel (Zero-Copy)** | **368–475 FPS** | **~2.10 ms** | **~0% (GPU Compute)** |
-| **Vulkan GPU Tile Differencing (8,160 Full 4K Tiles)** | **310–365 Passes/s** | **~2.74 ms** | **~0% (GPU Compute)** |
+| **Direct EVDI Zero-Copy Buffer Ingestion (100 Dirty Tiles)** | **755–1,221+ FPS** | **0.82–1.32 ms** | **0% (0 CPU memcpy)** |
+| **Vulkan Clipped Dirty Incremental Update (100 Tiles)** | **324–736+ FPS** | **~1.36–3.09 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Compute Kernel (Zero-Copy)** | **188–475 FPS** | **~2.10–5.30 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Tile Differencing (8,160 Full 4K Tiles)** | **129–365 Passes/s** | **~2.74–7.74 ms** | **~0% (GPU Compute)** |
 | **Vulkan GPU Indirect Dispatch Compression (Full Grid)** | **109–112+ FPS** | **~8.90 ms** | **~0% (GPU Compute)** |
-| **Vulkan End-to-End Frame Pipeline** | **102–112 FPS** | **~8.87 ms** | Minimal |
+| **Vulkan End-to-End Frame Pipeline** | **60–112 FPS** | **~8.87–16.66 ms** | Minimal |
 | **AVX2 SIMD Color Conversion** | 100+ FPS | ~9.9 ms | 100% Core Load |
 | **Original Scalar Reference** | ~18 FPS | ~55.0 ms | 100% Core Load |
 
@@ -68,6 +69,7 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 ## Features
 
+* **Direct EVDI Zero-Copy Buffer Ingestion**: Registers Vulkan's mapped GPU input buffers (`m_buf_input[0]` and `m_buf_input[1]`) directly with the EVDI kernel module (`evdi_register_buffer`) using dual pre-bound descriptor sets. Compositor frame updates write straight into GPU memory, eliminating 100% of CPU framebuffer `memcpy` operations and achieving **1,221+ FPS (0.82 ms/frame)** throughput!
 * **EVDI Damaged Bounding-Box Clipping**: Calculates tile-aligned damaged bounding boxes from EVDI dirty rectangles, restricting GPU compute workgroups and selective host row copies to the active region. Reduces CPU copy bandwidth by **98.5%** and accelerates dirty tile updates to **736+ FPS (1.36 ms)**.
 * **GPU Indirect Dispatch (`vkCmdDispatchIndirect`)**: Seamlessly chains GPU Differencing $\to$ GPU DMA Command Setup $\to$ GPU Parallel Compression inside a single command buffer with zero host CPU roundtrips or mid-frame fence stalls.
 * **End-to-End GPU Pipeline**: Zero CPU-to-GPU and GPU-to-CPU uncompressed frame swaps. The frame stays in GPU memory for differencing and compression.

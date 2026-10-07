@@ -40,8 +40,8 @@ public:
         int dst_uv_stride
     );
 
-    // Direct mapped GPU buffers for zero-copy color conversion
-    uint8_t* GetMappedInputBuffer(size_t required_bytes);
+    // Direct mapped GPU buffers for zero-copy frame ingestion
+    uint8_t* GetMappedInputBuffer(int buffer_id = 0, size_t required_bytes = 0);
     void GetMappedOutputPlanes(uint8_t*& y_plane, uint8_t*& u_plane, uint8_t*& v_plane);
     bool DispatchCompute(int width, int height, int src_stride, int dst_y_stride, int dst_uv_stride);
 
@@ -126,7 +126,7 @@ private:
     VkPipelineLayout m_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool m_desc_pool = VK_NULL_HANDLE;
-    VkDescriptorSet m_desc_set = VK_NULL_HANDLE;
+    VkDescriptorSet m_desc_set[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     // Tile differencing pipeline
     VkShaderModule m_diff_shader_module = VK_NULL_HANDLE;
@@ -134,7 +134,7 @@ private:
     VkPipelineLayout m_diff_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline m_diff_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool m_diff_desc_pool = VK_NULL_HANDLE;
-    VkDescriptorSet m_diff_desc_set = VK_NULL_HANDLE;
+    VkDescriptorSet m_diff_desc_set[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     // Tile compression pipeline
     VkShaderModule m_comp_shader_module = VK_NULL_HANDLE;
@@ -142,14 +142,14 @@ private:
     VkPipelineLayout m_comp_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline m_comp_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool m_comp_desc_pool = VK_NULL_HANDLE;
-    VkDescriptorSet m_comp_desc_set = VK_NULL_HANDLE;
+    VkDescriptorSet m_comp_desc_set[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     VkCommandPool m_cmd_pool = VK_NULL_HANDLE;
     VkCommandBuffer m_cmd_buffer = VK_NULL_HANDLE;
     VkFence m_fence = VK_NULL_HANDLE;
 
     // Buffers
-    VulkanBuffer m_buf_input;
+    VulkanBuffer m_buf_input[2]; // Double-buffered mapped input for zero-copy EVDI ingestion
     VulkanBuffer m_buf_y;
     VulkanBuffer m_buf_u;
     VulkanBuffer m_buf_v;

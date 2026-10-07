@@ -98,18 +98,20 @@ void VulkanConverter::DestroyBuffer(VulkanBuffer& buf) {
 }
 
 bool VulkanConverter::EnsureBuffers(size_t src_size, size_t y_size, size_t uv_size) {
-    if (m_buf_input.size >= src_size &&
+    if (m_buf_input[0].size >= src_size &&
+        m_buf_input[1].size >= src_size &&
         m_buf_y.size >= y_size &&
         m_buf_u.size >= uv_size &&
         m_buf_v.size >= uv_size) {
         return true;
     }
 
-    size_t alloc_src = std::max(src_size, m_buf_input.size * 2);
+    size_t alloc_src = std::max(src_size, m_buf_input[0].size * 2);
     size_t alloc_y   = std::max(y_size, m_buf_y.size * 2);
     size_t alloc_uv  = std::max(uv_size, m_buf_u.size * 2);
 
-    DestroyBuffer(m_buf_input);
+    DestroyBuffer(m_buf_input[0]);
+    DestroyBuffer(m_buf_input[1]);
     DestroyBuffer(m_buf_y);
     DestroyBuffer(m_buf_u);
     DestroyBuffer(m_buf_v);
@@ -118,14 +120,15 @@ bool VulkanConverter::EnsureBuffers(size_t src_size, size_t y_size, size_t uv_si
         VulkanBuffer& buf;
         size_t size;
         bool is_output;
-    } specs[4] = {
-        { m_buf_input, alloc_src, false },
-        { m_buf_y,     alloc_y,   true  },
-        { m_buf_u,     alloc_uv,  true  },
-        { m_buf_v,     alloc_uv,  true  }
+    } specs[5] = {
+        { m_buf_input[0], alloc_src, false },
+        { m_buf_input[1], alloc_src, false },
+        { m_buf_y,        alloc_y,   true  },
+        { m_buf_u,        alloc_uv,  true  },
+        { m_buf_v,        alloc_uv,  true  }
     };
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         VkBufferCreateInfo bci = {};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bci.size = specs[i].size;
@@ -166,24 +169,26 @@ bool VulkanConverter::EnsureBuffers(size_t src_size, size_t y_size, size_t uv_si
         specs[i].buf.size = specs[i].size;
     }
 
-    VkDescriptorBufferInfo bufDescs[4] = {
-        { m_buf_input.buffer, 0, m_buf_input.size },
-        { m_buf_y.buffer,     0, m_buf_y.size },
-        { m_buf_u.buffer,     0, m_buf_u.size },
-        { m_buf_v.buffer,     0, m_buf_v.size }
-    };
+    for (int b = 0; b < 2; b++) {
+        VkDescriptorBufferInfo bufDescs[4] = {
+            { m_buf_input[b].buffer, 0, m_buf_input[b].size },
+            { m_buf_y.buffer,        0, m_buf_y.size },
+            { m_buf_u.buffer,        0, m_buf_u.size },
+            { m_buf_v.buffer,        0, m_buf_v.size }
+        };
 
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = m_desc_set;
-        writes[i].dstBinding = i;
-        writes[i].dstArrayElement = 0;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].descriptorCount = 1;
-        writes[i].pBufferInfo = &bufDescs[i];
+        VkWriteDescriptorSet writes[4] = {};
+        for (int i = 0; i < 4; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = m_desc_set[b];
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].descriptorCount = 1;
+            writes[i].pBufferInfo = &bufDescs[i];
+        }
+        vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
     }
-    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
 
     return true;
 }
@@ -192,14 +197,15 @@ bool VulkanConverter::EnsureDiffBuffers(size_t fb_size, uint32_t total_tiles) {
     size_t mask_size = ((total_tiles + 31) / 32) * sizeof(uint32_t);
     size_t list_size = sizeof(uint32_t) + total_tiles * sizeof(uint32_t);
 
-    if (m_buf_input.size >= fb_size &&
+    if (m_buf_input[0].size >= fb_size &&
+        m_buf_input[1].size >= fb_size &&
         m_buf_diff_ref.size >= fb_size &&
         m_buf_diff_mask.size >= mask_size &&
         m_buf_diff_list.size >= list_size) {
         return true;
     }
 
-    // Ensure input buffer is allocated
+    // Ensure input buffers are allocated
     if (!EnsureBuffers(fb_size, fb_size / 4, fb_size / 16)) return false;
 
     // Allocate reference frame buffer (Device Local on GPU for max performance)
@@ -273,25 +279,27 @@ bool VulkanConverter::EnsureDiffBuffers(size_t fb_size, uint32_t total_tiles) {
 
     m_diff_total_tiles = total_tiles;
 
-    // Update differencing descriptor set
-    VkDescriptorBufferInfo dbi[4] = {
-        { m_buf_input.buffer,     0, fb_size },
-        { m_buf_diff_ref.buffer,  0, fb_size },
-        { m_buf_diff_mask.buffer, 0, mask_size },
-        { m_buf_diff_list.buffer, 0, list_size }
-    };
+    // Update differencing descriptor sets for both double-buffered inputs
+    for (int b = 0; b < 2; b++) {
+        VkDescriptorBufferInfo dbi[4] = {
+            { m_buf_input[b].buffer,  0, fb_size },
+            { m_buf_diff_ref.buffer,  0, fb_size },
+            { m_buf_diff_mask.buffer, 0, mask_size },
+            { m_buf_diff_list.buffer, 0, list_size }
+        };
 
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = m_diff_desc_set;
-        writes[i].dstBinding = i;
-        writes[i].dstArrayElement = 0;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].descriptorCount = 1;
-        writes[i].pBufferInfo = &dbi[i];
+        VkWriteDescriptorSet writes[4] = {};
+        for (int i = 0; i < 4; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = m_diff_desc_set[b];
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].descriptorCount = 1;
+            writes[i].pBufferInfo = &dbi[i];
+        }
+        vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
     }
-    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
     UpdateCompDescriptors();
 
     return true;
@@ -502,8 +510,8 @@ bool VulkanConverter::Initialize() {
     }
 
     // 7. Descriptor Pools & Sets
-    VkDescriptorPoolSize poolSizes[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 } };
-    VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 4, 1, poolSizes };
+    VkDescriptorPoolSize poolSizes[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 } };
+    VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 8, 1, poolSizes };
 
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_desc_pool) != VK_SUCCESS) {
         LOG_ERROR("Failed to create descriptor pool");
@@ -511,23 +519,26 @@ bool VulkanConverter::Initialize() {
         return false;
     }
 
-    VkDescriptorSetAllocateInfo allocSetInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 1, &m_desc_layout };
-    if (vkAllocateDescriptorSets(m_device, &allocSetInfo, &m_desc_set) != VK_SUCCESS) {
-        LOG_ERROR("Failed to allocate color descriptor set");
+    VkDescriptorSetLayout colorLayouts[2] = { m_desc_layout, m_desc_layout };
+    VkDescriptorSetAllocateInfo allocSetInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 2, colorLayouts };
+    if (vkAllocateDescriptorSets(m_device, &allocSetInfo, m_desc_set) != VK_SUCCESS) {
+        LOG_ERROR("Failed to allocate color descriptor sets");
         Cleanup();
         return false;
     }
 
-    VkDescriptorSetAllocateInfo diffAllocSetInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 1, &m_diff_desc_layout };
-    if (vkAllocateDescriptorSets(m_device, &diffAllocSetInfo, &m_diff_desc_set) != VK_SUCCESS) {
-        LOG_ERROR("Failed to allocate diff descriptor set");
+    VkDescriptorSetLayout diffLayouts[2] = { m_diff_desc_layout, m_diff_desc_layout };
+    VkDescriptorSetAllocateInfo diffAllocSetInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 2, diffLayouts };
+    if (vkAllocateDescriptorSets(m_device, &diffAllocSetInfo, m_diff_desc_set) != VK_SUCCESS) {
+        LOG_ERROR("Failed to allocate diff descriptor sets");
         Cleanup();
         return false;
     }
 
-    VkDescriptorSetAllocateInfo compAllocSetInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 1, &m_comp_desc_layout };
-    if (vkAllocateDescriptorSets(m_device, &compAllocSetInfo, &m_comp_desc_set) != VK_SUCCESS) {
-        LOG_ERROR("Failed to allocate comp descriptor set");
+    VkDescriptorSetLayout compLayouts[2] = { m_comp_desc_layout, m_comp_desc_layout };
+    VkDescriptorSetAllocateInfo compAllocSetInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 2, compLayouts };
+    if (vkAllocateDescriptorSets(m_device, &compAllocSetInfo, m_comp_desc_set) != VK_SUCCESS) {
+        LOG_ERROR("Failed to allocate comp descriptor sets");
         Cleanup();
         return false;
     }
@@ -565,7 +576,8 @@ void VulkanConverter::Cleanup() {
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
 
-        DestroyBuffer(m_buf_input);
+        DestroyBuffer(m_buf_input[0]);
+        DestroyBuffer(m_buf_input[1]);
         DestroyBuffer(m_buf_y);
         DestroyBuffer(m_buf_u);
         DestroyBuffer(m_buf_v);
@@ -576,6 +588,13 @@ void VulkanConverter::Cleanup() {
         DestroyBuffer(m_buf_packet_out);
         DestroyBuffer(m_buf_indirect);
         m_packet_capacity = 0;
+
+        m_desc_set[0] = VK_NULL_HANDLE;
+        m_desc_set[1] = VK_NULL_HANDLE;
+        m_diff_desc_set[0] = VK_NULL_HANDLE;
+        m_diff_desc_set[1] = VK_NULL_HANDLE;
+        m_comp_desc_set[0] = VK_NULL_HANDLE;
+        m_comp_desc_set[1] = VK_NULL_HANDLE;
 
         if (m_fence != VK_NULL_HANDLE) { vkDestroyFence(m_device, m_fence, nullptr); m_fence = VK_NULL_HANDLE; }
         if (m_cmd_pool != VK_NULL_HANDLE) { vkDestroyCommandPool(m_device, m_cmd_pool, nullptr); m_cmd_pool = VK_NULL_HANDLE; }
@@ -608,11 +627,14 @@ void VulkanConverter::Cleanup() {
     m_initialized = false;
 }
 
-uint8_t* VulkanConverter::GetMappedInputBuffer(size_t required_bytes) {
+uint8_t* VulkanConverter::GetMappedInputBuffer(int buffer_id, size_t required_bytes) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized) return nullptr;
-    if (!EnsureBuffers(required_bytes, required_bytes / 4, required_bytes / 16)) return nullptr;
-    return static_cast<uint8_t*>(m_buf_input.mapped);
+    if (buffer_id < 0 || buffer_id >= 2) buffer_id = 0;
+    if (required_bytes > 0) {
+        if (!EnsureBuffers(required_bytes, required_bytes / 4, required_bytes / 16)) return nullptr;
+    }
+    return static_cast<uint8_t*>(m_buf_input[buffer_id].mapped);
 }
 
 void VulkanConverter::GetMappedOutputPlanes(uint8_t*& y_plane, uint8_t*& u_plane, uint8_t*& v_plane) {
@@ -635,7 +657,7 @@ bool VulkanConverter::DispatchCompute(int width, int height, int src_stride, int
     if (vkBeginCommandBuffer(m_cmd_buffer, &beginInfo) != VK_SUCCESS) return false;
 
     vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline_layout, 0, 1, &m_desc_set, 0, nullptr);
+    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline_layout, 0, 1, &m_desc_set[0], 0, nullptr);
     vkCmdPushConstants(m_cmd_buffer, m_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
     uint32_t group_x = ((width + 1) / 2 + 15) / 16;
@@ -672,7 +694,7 @@ bool VulkanConverter::ConvertRgb32ToYuv420(
 
     if (!EnsureBuffers(src_size, y_size, uv_size)) return false;
 
-    std::memcpy(m_buf_input.mapped, src_argb, src_size);
+    std::memcpy(m_buf_input[0].mapped, src_argb, src_size);
 
     if (!DispatchCompute(width, height, src_stride, dst_y_stride, dst_uv_stride)) {
         return false;
@@ -734,7 +756,7 @@ bool VulkanConverter::DispatchTileDifferencing(
     vkCmdPipelineBarrier(m_cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_clear, 0, nullptr, 0, nullptr);
 
     vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set, 0, nullptr);
+    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set[0], 0, nullptr);
     vkCmdPushConstants(m_cmd_buffer, m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
     vkCmdDispatch(m_cmd_buffer, num_cols, num_rows, 1);
@@ -787,7 +809,9 @@ bool VulkanConverter::DetectDirtyTiles(
 
     if (!EnsureDiffBuffers(fb_size, total_tiles)) return false;
 
-    std::memcpy(m_buf_input.mapped, curr_fb, fb_size);
+    if (curr_fb && curr_fb != m_buf_input[0].mapped && curr_fb != m_buf_input[1].mapped) {
+        std::memcpy(m_buf_input[0].mapped, curr_fb, fb_size);
+    }
 
     int stride_words = fb_stride / 4;
     if (!DispatchTileDifferencing(width, height, stride_words, tile_size, true)) {
@@ -836,7 +860,9 @@ bool VulkanConverter::FilterDirtyTilesGpu(
 
     if (!EnsureDiffBuffers(fb_size, total_tiles)) return false;
 
-    std::memcpy(m_buf_input.mapped, curr_fb, fb_size);
+    if (curr_fb && curr_fb != m_buf_input[0].mapped && curr_fb != m_buf_input[1].mapped) {
+        std::memcpy(m_buf_input[0].mapped, curr_fb, fb_size);
+    }
 
     int stride_words = fb_stride / 4;
     if (!DispatchTileDifferencing(width, height, stride_words, tile_size, true)) {
@@ -868,32 +894,35 @@ bool VulkanConverter::FilterDirtyTilesGpu(
 }
 
 void VulkanConverter::UpdateCompDescriptors() {
-    if (m_comp_desc_set == VK_NULL_HANDLE ||
-        m_buf_input.buffer == VK_NULL_HANDLE ||
+    if (m_comp_desc_set[0] == VK_NULL_HANDLE ||
+        m_buf_input[0].buffer == VK_NULL_HANDLE ||
+        m_buf_input[1].buffer == VK_NULL_HANDLE ||
         m_buf_diff_list.buffer == VK_NULL_HANDLE ||
         m_buf_packet_meta.buffer == VK_NULL_HANDLE ||
         m_buf_packet_out.buffer == VK_NULL_HANDLE) {
         return;
     }
 
-    VkDescriptorBufferInfo dbi[4] = {
-        { m_buf_input.buffer,       0, m_buf_input.size },
-        { m_buf_diff_list.buffer,   0, m_buf_diff_list.size },
-        { m_buf_packet_meta.buffer, 0, m_buf_packet_meta.size },
-        { m_buf_packet_out.buffer,  0, m_buf_packet_out.size }
-    };
+    for (int b = 0; b < 2; b++) {
+        VkDescriptorBufferInfo dbi[4] = {
+            { m_buf_input[b].buffer,    0, m_buf_input[b].size },
+            { m_buf_diff_list.buffer,   0, m_buf_diff_list.size },
+            { m_buf_packet_meta.buffer, 0, m_buf_packet_meta.size },
+            { m_buf_packet_out.buffer,  0, m_buf_packet_out.size }
+        };
 
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = m_comp_desc_set;
-        writes[i].dstBinding = i;
-        writes[i].dstArrayElement = 0;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].descriptorCount = 1;
-        writes[i].pBufferInfo = &dbi[i];
+        VkWriteDescriptorSet writes[4] = {};
+        for (int i = 0; i < 4; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = m_comp_desc_set[b];
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].descriptorCount = 1;
+            writes[i].pBufferInfo = &dbi[i];
+        }
+        vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
     }
-    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
 }
 
 bool VulkanConverter::EnsurePacketBuffers(size_t max_capacity) {
@@ -1040,17 +1069,23 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         }
     }
 
-    if (curr_fb && curr_fb != m_buf_input.mapped) {
+    int buf_idx = 0;
+    if (curr_fb == m_buf_input[0].mapped) {
+        buf_idx = 0; // Zero-copy: already inside GPU mapped input buffer 0!
+    } else if (curr_fb == m_buf_input[1].mapped) {
+        buf_idx = 1; // Zero-copy: already inside GPU mapped input buffer 1!
+    } else if (curr_fb) {
+        buf_idx = 0;
         if (has_bounds) {
             // Fast Path: Only copy the rows covered by the dirty bounding box!
             uint32_t start_y = start_row * tile_size;
             uint32_t end_y = std::min((start_row + num_rows) * tile_size, static_cast<uint32_t>(height));
             size_t row_offset = static_cast<size_t>(start_y) * fb_stride;
             size_t copy_bytes = static_cast<size_t>(end_y - start_y) * fb_stride;
-            std::memcpy(static_cast<uint8_t*>(m_buf_input.mapped) + row_offset,
+            std::memcpy(static_cast<uint8_t*>(m_buf_input[0].mapped) + row_offset,
                         curr_fb + row_offset, copy_bytes);
         } else {
-            std::memcpy(m_buf_input.mapped, curr_fb, fb_size);
+            std::memcpy(m_buf_input[0].mapped, curr_fb, fb_size);
         }
     }
 
@@ -1095,7 +1130,7 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         start_row
     };
     vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set, 0, nullptr);
+    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set[buf_idx], 0, nullptr);
     vkCmdPushConstants(m_cmd_buffer, m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(diff_pc), &diff_pc);
     vkCmdDispatch(m_cmd_buffer, num_cols, num_rows, 1);
 
@@ -1157,7 +1192,7 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         0u
     };
     vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline_layout, 0, 1, &m_comp_desc_set, 0, nullptr);
+    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline_layout, 0, 1, &m_comp_desc_set[buf_idx], 0, nullptr);
     vkCmdPushConstants(m_cmd_buffer, m_comp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(comp_pc), &comp_pc);
 
     vkCmdDispatchIndirect(m_cmd_buffer, m_buf_indirect.buffer, 0);

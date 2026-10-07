@@ -68,6 +68,8 @@ private:
 
     struct FrameBuffer {
         int id;
+        bool external = false;
+        uint8_t* data_ptr = nullptr;
         std::vector<uint8_t> memory;
         int width;
         int height;

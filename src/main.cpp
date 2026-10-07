@@ -114,6 +114,30 @@ void RunBenchmark() {
 
         LOG_INFO("  Incremental Update (100 Clipped Dirty Tiles): %d passes in %.2f ms", DIRTY_BENCH_PASSES, comp_ms);
         LOG_INFO("  Throughput: %.2f FPS (%.2f ms/frame)", (DIRTY_BENCH_PASSES * 1000.0) / comp_ms, comp_ms / DIRTY_BENCH_PASSES);
+
+        // 5. True Zero-Copy EVDI Direct Mapped Buffer Ingestion (Double-Buffered)
+        uint8_t* mapped_fb0 = vk.GetMappedInputBuffer(0, WIDTH * HEIGHT * 4);
+        uint8_t* mapped_fb1 = vk.GetMappedInputBuffer(1, WIDTH * HEIGHT * 4);
+        if (mapped_fb0 && mapped_fb1) {
+            std::memcpy(mapped_fb0, rgb_buffer.data(), WIDTH * HEIGHT * 4);
+            std::memcpy(mapped_fb1, rgb_buffer.data(), WIDTH * HEIGHT * 4);
+
+            auto start_zc = std::chrono::high_resolution_clock::now();
+            for (int p = 0; p < DIRTY_BENCH_PASSES; ++p) {
+                uint8_t* cur_mapped = (p % 2 == 0) ? mapped_fb0 : mapped_fb1;
+                for (int t = 0; t < 100; ++t) {
+                    int px = (t % 10) * 32;
+                    int py = (t / 10) * 32;
+                    cur_mapped[(py * WIDTH + px) * 4] ^= static_cast<uint8_t>(p + 1);
+                }
+                vk.EncodeFramePacketsGpu(cur_mapped, WIDTH * 4, WIDTH, HEIGHT, 32, p + 100, total_packet_bytes, dirty_rects);
+            }
+            auto end_zc = std::chrono::high_resolution_clock::now();
+            double zc_ms = std::chrono::duration<double, std::milli>(end_zc - start_zc).count();
+
+            LOG_INFO("  Direct EVDI Zero-Copy Buffer Ingestion (100 Dirty Tiles): %d passes in %.2f ms", DIRTY_BENCH_PASSES, zc_ms);
+            LOG_INFO("  Zero-Copy Throughput: %.2f FPS (%.2f ms/frame)", (DIRTY_BENCH_PASSES * 1000.0) / zc_ms, zc_ms / DIRTY_BENCH_PASSES);
+        }
     }
 
     // Verify sample output values
