@@ -85,17 +85,26 @@ void RunBenchmark() {
         LOG_INFO("  Diff Throughput: %.2f Passes/sec (%.2f ms/pass)", (FRAMES * 1000.0) / diff_ms, diff_ms / FRAMES);
 
         // 4. GPU Tile Compression & USB Wire Packet Packaging
-        for (size_t i = 0; i < rgb_buffer.size(); i += 128) {
-            rgb_buffer[i] ^= 0x55;
-        }
         uint32_t total_packet_bytes = 0;
-        const uint8_t* pkt = vk.EncodeFramePacketsGpu(rgb_buffer.data(), WIDTH * 4, WIDTH, HEIGHT, 32, 1, total_packet_bytes);
-        if (pkt && total_packet_bytes > sizeof(dl_turbo::protocol::FrameSectionHeader)) {
-            const auto* hdr = reinterpret_cast<const dl_turbo::protocol::FrameSectionHeader*>(pkt);
-            LOG_INFO("[Vulkan GPU Tile Compression (Wire Packet Stream)]");
-            LOG_INFO("  Full 4K Keyframe: %u dirty tiles -> %u KB packet (DLFR magic: 0x%08X)",
-                     hdr->tile_count, total_packet_bytes / 1024, hdr->magic);
+        uint32_t last_key_tiles = 0;
+        const int KEYFRAME_PASSES = 10;
+        auto start_key = std::chrono::high_resolution_clock::now();
+        for (int k = 0; k < KEYFRAME_PASSES; ++k) {
+            for (size_t i = 0; i < rgb_buffer.size(); i += 128) {
+                rgb_buffer[i] ^= static_cast<uint8_t>(k + 0x33);
+            }
+            vk.EncodeFramePacketsGpu(rgb_buffer.data(), WIDTH * 4, WIDTH, HEIGHT, 32, k + 1, total_packet_bytes);
+            if (total_packet_bytes > sizeof(dl_turbo::protocol::FrameSectionHeader)) {
+                last_key_tiles = reinterpret_cast<const dl_turbo::protocol::FrameSectionHeader*>(vk.GetMappedPacketBuffer())->tile_count;
+            }
         }
+        auto end_key = std::chrono::high_resolution_clock::now();
+        double key_ms = std::chrono::duration<double, std::milli>(end_key - start_key).count();
+
+        LOG_INFO("[Vulkan GPU Tile Compression (Wire Packet Stream)]");
+        LOG_INFO("  Full 4K Keyframe: %u dirty tiles -> %u KB packet", last_key_tiles, total_packet_bytes / 1024);
+        LOG_INFO("  Full 4K Keyframe Throughput (%d passes): %.2f FPS (%.2f ms/frame)",
+                 KEYFRAME_PASSES, (KEYFRAME_PASSES * 1000.0) / key_ms, key_ms / KEYFRAME_PASSES);
 
         // Benchmark incremental update: modify 100 tiles per frame in an active window
         const int DIRTY_BENCH_PASSES = 50;
