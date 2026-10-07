@@ -1,4 +1,5 @@
 #include "color_converter.hpp"
+#include "vulkan_converter.hpp"
 #include <algorithm>
 #include <immintrin.h>
 #include <cpuid.h>
@@ -19,6 +20,20 @@ ColorConverter::ColorConverter() {
     s_has_avx2 = DetectAvx2();
 }
 
+bool ColorConverter::IsVulkanAccelerated() {
+    return VulkanConverter::Instance().IsAvailable();
+}
+
+const char* ColorConverter::GetAccelerationEngine() {
+    if (VulkanConverter::Instance().IsAvailable()) {
+        return "Vulkan SPIR-V Compute";
+    }
+    if (s_has_avx2) {
+        return "AVX2 SIMD";
+    }
+    return "Scalar CPU";
+}
+
 // Fixed-point clamping helper
 static inline uint8_t clamp_u8(int32_t val) {
     if (val < 0) return 0;
@@ -26,7 +41,7 @@ static inline uint8_t clamp_u8(int32_t val) {
     return static_cast<uint8_t>(val);
 }
 
-// Standard BT.601 RGB-to-YUV420 conversion
+// BT.601 RGB-to-YUV420 conversion with GPU Vulkan compute and CPU AVX2 fallback
 void ColorConverter::Rgb32ToYuv420(
     const uint8_t* src_argb,
     int src_stride,
@@ -38,11 +53,22 @@ void ColorConverter::Rgb32ToYuv420(
     int dst_y_stride,
     int dst_uv_stride
 ) {
+    // 1. Hardware Vulkan compute acceleration
+    if (VulkanConverter::Instance().IsAvailable() && width >= 64 && height >= 64) {
+        if (VulkanConverter::Instance().ConvertRgb32ToYuv420(
+                src_argb, src_stride, width, height,
+                dst_y, dst_u, dst_v, dst_y_stride, dst_uv_stride)) {
+            return;
+        }
+    }
+
+    // 2. SIMD AVX2 acceleration fallback
     if (s_has_avx2 && (width % 16 == 0)) {
         Rgb32ToYuv420Avx2(src_argb, src_stride, width, height, dst_y, dst_u, dst_v, dst_y_stride, dst_uv_stride);
         return;
     }
 
+    // 3. Scalar reference fallback
     for (int y = 0; y < height; ++y) {
         const uint32_t* src_row = reinterpret_cast<const uint32_t*>(src_argb + y * src_stride);
         uint8_t* y_row = dst_y + y * dst_y_stride;
@@ -51,16 +77,13 @@ void ColorConverter::Rgb32ToYuv420(
 
         for (int x = 0; x < width; ++x) {
             uint32_t pixel = src_row[x];
-            // ARGB format: B=0, G=1, R=2, A=3 in Little Endian
             int32_t b = (pixel & 0xFF);
             int32_t g = ((pixel >> 8) & 0xFF);
             int32_t r = ((pixel >> 16) & 0xFF);
 
-            // BT.601 integer coefficients
             int32_t y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
             y_row[x] = clamp_u8(y_val);
 
-            // Sample chroma every 2x2 block
             if ((y % 2 == 0) && (x % 2 == 0)) {
                 int32_t u_val = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
                 int32_t v_val = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
@@ -163,9 +186,6 @@ void ColorConverter::Yuv420ToRgb32Scalar(
         uint32_t cb_val = static_cast<uint32_t>(src_u[i / 2]);
         uint32_t cr_val = static_cast<uint32_t>(src_v[i / 2]);
 
-        // Constants from DisplayLink decompiled kernel:
-        // 0x2543 (9539), 0x408d (16525), 0x3311 (13073), 0x4d16 (19734), 0xffffe5fc (-6660)
-        // Biases: 0x1bdca8, 0x229aa8, 0x10f258
         int32_t r_accum = static_cast<int32_t>(cr_val * 0x3311);
         int32_t y_scaled = static_cast<int32_t>(y_val * 0x2543);
         int32_t b_accum = static_cast<int32_t>(cb_val * 0x408d);
@@ -194,7 +214,6 @@ void ColorConverter::Yuv420ToRgb32Simd(
     int width,
     int count
 ) {
-    // Process using SIMD if supported, else fallback to scalar
     Yuv420ToRgb32Scalar(src_y, src_u, src_v, dst_rgba, width, count);
 }
 

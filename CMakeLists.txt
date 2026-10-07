@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dl-x-vk VERSION 1.0.0 LANGUAGES C CXX)
+project(dl-x-vk VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,13 +22,36 @@ if(NOT EVDI_INCLUDE_DIR OR NOT EVDI_LIBRARY)
     message(FATAL_ERROR "evdi development headers or library (libevdi.so) not found!")
 endif()
 
+# Find Vulkan library
+find_library(VULKAN_LIBRARY NAMES vulkan PATHS /usr/lib /usr/lib64 /usr/local/lib)
+if(NOT VULKAN_LIBRARY)
+    find_package(Vulkan REQUIRED)
+    set(VULKAN_LIBRARY Vulkan::Vulkan)
+endif()
+
+# Find glslc compiler for shader compilation
+find_program(GLSLC_COMPILER glslc)
+if(GLSLC_COMPILER)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420_spv.inc
+        COMMAND ${GLSLC_COMPILER} -mfmt=c ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420.comp -o ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420_spv.inc
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420.comp
+        COMMENT "Compiling Compute Shader rgb_to_yuv420.comp with glslc"
+    )
+    add_custom_target(compile_shaders ALL
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420_spv.inc
+    )
+endif()
+
 message(STATUS "Found libusb: ${LIBUSB_INCLUDE_DIRS} ${LIBUSB_LIBRARIES}")
 message(STATUS "Found evdi: ${EVDI_INCLUDE_DIR} ${EVDI_LIBRARY}")
+message(STATUS "Found vulkan: ${VULKAN_LIBRARY}")
 
 # Sources
 set(SOURCES
     src/main.cpp
     src/color_converter.cpp
+    src/vulkan_converter.cpp
     src/tile_engine.cpp
     src/codec_dl3.cpp
     src/usb_transport.cpp
@@ -37,9 +60,13 @@ set(SOURCES
 )
 
 add_executable(dl-x-vk ${SOURCES})
+if(GLSLC_COMPILER)
+    add_dependencies(dl-x-vk compile_shaders)
+endif()
 
 target_include_directories(dl-x-vk PRIVATE
     src
+    include
     ${LIBUSB_INCLUDE_DIRS}
     ${EVDI_INCLUDE_DIR}
 )
@@ -47,6 +74,7 @@ target_include_directories(dl-x-vk PRIVATE
 target_link_libraries(dl-x-vk PRIVATE
     ${LIBUSB_LIBRARIES}
     ${EVDI_LIBRARY}
+    ${VULKAN_LIBRARY}
     pthread
 )
 

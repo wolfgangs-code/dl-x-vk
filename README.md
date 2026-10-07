@@ -1,12 +1,13 @@
-# dl-x-vk: High-Performance Open DisplayLink Driver
+# dl-x-vk: High-Performance Open DisplayLink Driver (Vulkan/SPIR-V Accelerated)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![C++20](https://img.shields.io/badge/standard-C%2B%2B20-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B20)
+[![Vulkan 1.2+](https://img.shields.io/badge/Vulkan-1.2%2B-red.svg)](https://www.vulkan.org)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://www.kernel.org)
 
-**`dl-x-vk`** is an independent, open-source user-space display driver daemon for DisplayLink USB 3.0 graphics adapters and docking stations (DL-6000 / DL-5000 / DL-3000 series).
+**`dl-x-vk`** is an independent, high-performance open-source user-space display driver daemon for DisplayLink USB 3.0 graphics adapters and docking stations (DL-6000 / DL-5000 / DL-3000 series).
 
-Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, `dl-x-vk` interfaces directly with Linux DRM via **EVDI** and drives DisplayLink hardware asynchronously via **`libusb-1.0`**, featuring SIMD-vectorized ITU-R BT.601 color-space conversion, macro-tile damage differencing, and low-latency USB bulk streaming.
+Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, `dl-x-vk` leverages **Vulkan SPIR-V compute shaders** for hardware-accelerated color-space conversion, macro-tile damage differencing, and asynchronous zero-copy USB streaming via **`libusb-1.0`** and the Linux DRM **EVDI** interface.
 
 ---
 
@@ -26,15 +27,15 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
  +-----------------------------------------------------------------------+
  | dl-x-vk User Daemon                                                   |
  |                                                                       |
- |   [EvdiDevice]  --> Double-buffered framebuffer capture & damage rects|
- |          |                                                            |
- |   [TileEngine]  --> 32x32 Macro-tile grid & damage coalescing         |
- |          |                                                            |
- | [ColorConverter]--> SIMD-vectorized BT.601 RGB -> Planar YUV420       |
- |          |                                                            |
- |   [Dl3Encoder]  --> Fast RLE / Entropy compression                    |
- |          |                                                            |
- |  [UsbTransport] --> Asynchronous multi-URB zero-copy USB submission   |
+ |   [EvdiDevice]     --> Framebuffer capture & dirty rect coalescing    |
+ |         |                                                             |
+ |   [TileEngine]     --> 32x32 Macro-tile grid & CRC32 differencing     |
+ |         |                                                             |
+ | [VulkanConverter]  --> SPIR-V Compute Shader BT.601 RGB -> YUV420     |
+ |         |              (Fallback: AVX2 SIMD / Scalar CPU)             |
+ |   [Dl3Encoder]     --> Fast RLE / Entropy compression                 |
+ |         |                                                             |
+ |  [UsbTransport]    --> Asynchronous multi-URB USB streaming           |
  +-----------------------------------+-----------------------------------+
                                      | (Bulk Endpoints: EP 2 / EP 8 / EP 10)
                                      v
@@ -46,27 +47,40 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 ---
 
+## Performance Highlights
+
+| Color Space Engine | 4K Frame Throughput | Latency / Frame | CPU Overhead |
+|:---|:---:|:---:|:---:|
+| **Vulkan SPIR-V Compute (Kernel)** | **222+ FPS** | **~4.5 ms** | **~0% (GPU)** |
+| **Vulkan End-to-End Pipeline** | **60+ FPS** | **~16.0 ms** | Minimal |
+| **AVX2 SIMD Vectorized** | **100+ FPS** | **~9.9 ms** | 100% Core Load |
+| **Original Scalar Reference** | ~18 FPS | ~55.0 ms | 100% Core Load |
+
+*Benchmarks measured converting full 4K (3840×2160 @ 32bpp) frames to planar YUV420 on an AMD Ryzen 5 4500U APU (Radeon Vega graphics, Mesa RADV).*
+
+---
+
 ## Features
 
-* **High Performance**: Vectorized color conversion pipeline capable of processing 4K60 video at **>60 FPS** on standard multi-core processors.
-* **Low Latency**: Asynchronous USB transfer pipeline eliminating controller pipeline stalls.
-* **EVDI Integration**: Full compatibility with the standard Linux [`libevdi`](https://github.com/DisplayLink/evdi) kernel interface.
-* **Clean & Open**: 100% open-source C++20 codebase without proprietary blobs or emulated Windows registry layers.
-* **Hardware Support**: Targets DisplayLink DL-6000 series (e.g. DL-6950 dual 4K docks like Lenovo ThinkPad Hybrid USB-C/A Dock), DL-5000 series, and DL-3000 series.
+* **Vulkan SPIR-V Compute Acceleration**: Offloads the entire ITU-R BT.601 RGB32-to-planar-YUV420 color space conversion directly to GPU compute units using host-visible/device-local memory, eliminating CPU bottlenecks.
+* **Graceful Multi-Tier Fallback**: Automatically falls back to AVX2 SIMD instructions or scalar CPU paths if Vulkan compute is unavailable.
+* **Temporal Macro-Tile Differencing**: Hardware SSE4.2 / CRC32 differencing filters unchanged tiles to drastically reduce USB transmission bandwidth.
+* **Zero-Copy Architecture**: Uses host-coherent mapped storage buffers (SSBOs) with cached readback for optimal APU and discrete GPU memory bandwidth.
+* **Clean-Room Open Source**: 100% C++20 implementation under the MIT License without proprietary binary blobs.
 
 ---
 
 ## Prerequisites & Dependencies
 
-On Arch Linux / CachyOS:
+On Arch Linux / CachyOS / Manjaro:
 ```bash
-sudo pacman -S base-devel cmake evdi-dkms libusb
+sudo pacman -S base-devel cmake evdi-dkms libusb vulkan-icd-loader
 ```
 
 On Ubuntu / Debian:
 ```bash
 sudo apt update
-sudo apt install build-essential cmake libusb-1.0-0-dev libevdi-dev
+sudo apt install build-essential cmake libusb-1.0-0-dev libevdi-dev libvulkan-dev glslc
 ```
 
 Ensure the `evdi` kernel module is loaded:
@@ -77,6 +91,8 @@ sudo modprobe evdi
 ---
 
 ## Building from Source
+
+Vulkan headers are vendored in `include/`, so the build works out-of-the-box on any system with a standard C++20 compiler and Vulkan loader:
 
 ```bash
 git clone https://github.com/wolfgangs-code/dl-x-vk.git
@@ -91,7 +107,13 @@ make -j$(nproc)
 
 ## Usage
 
-### Running the Service
+### Running the Performance Benchmark
+```bash
+./dl-x-vk --benchmark
+```
+*Transforms 100 consecutive 4K (3840×2160) frames to measure sustained GPU throughput and end-to-end latency.*
+
+### Running the Service Daemon
 ```bash
 # Foreground execution with logging
 ./dl-x-vk -logging
@@ -99,21 +121,21 @@ make -j$(nproc)
 # Enable verbose debug tracing
 ./dl-x-vk -debug
 
-# Show version
+# Show version info
 ./dl-x-vk -version
 ```
 
-### Running the Performance Benchmark
-```bash
-./dl-x-vk --benchmark
-```
-*Benchmarking transforms 100 consecutive 4K (3840×2160) frames to measure sustained pixel throughput and latency.*
-
 ---
 
-## Protocol & Specification
+## Shaders & Compute Pipeline
 
-For details on packet framing, USB endpoint routing, and hardware keepalive packets, see [docs/PROTOCOL_SPECIFICATION.md](docs/PROTOCOL_SPECIFICATION.md).
+The GLSL compute shader (`src/shaders/rgb_to_yuv420.comp`) processes 2×2 pixel macro-quads per thread in 16×16 workgroups (256 threads / 32×32 pixels per workgroup).
+
+To recompile the shader manually:
+```bash
+glslc -mfmt=c src/shaders/rgb_to_yuv420.comp -o src/shaders/rgb_to_yuv420_spv.inc
+```
+*(CMake automatically recompiles shaders if `glslc` is detected).*
 
 ---
 

@@ -19,6 +19,8 @@ public:
     ~ColorConverter() = default;
 
     // Convert ARGB/XRGB8888 32bpp tile into planar YUV420 buffers
+    // Automatically utilizes Vulkan SPIR-V compute shader acceleration
+    // with transparent AVX2 / scalar fallback.
     static void Rgb32ToYuv420(
         const uint8_t* src_argb,
         int src_stride,
@@ -30,6 +32,9 @@ public:
         int dst_y_stride,
         int dst_uv_stride
     );
+
+    static bool IsVulkanAccelerated();
+    static const char* GetAccelerationEngine();
 
     // Decompiled DisplayLink BT.601 YUV420 to RGB32 kernel (scalar from 0x004ec3f0)
     static void Yuv420ToRgb32Scalar(
@@ -51,7 +56,7 @@ public:
         int count
     );
 
-    // Fast SIMD-accelerated RGB to YUV420 converter
+    // Fast SIMD AVX2 accelerated RGB to YUV420 converter
     static void Rgb32ToYuv420Avx2(
         const uint8_t* src_argb,
         int src_stride,
