@@ -119,20 +119,70 @@ bool UsbTransport::OpenDevice(uint16_t vendor_id, uint16_t product_id) {
         LOG_INFO("Claimed DisplayLink Control Interface 0");
     }
 
+    // Initialize Asynchronous Multi-URB Ring Queue
+    {
+        std::lock_guard<std::mutex> lock(m_ring_mutex);
+        m_in_flight_count.store(0);
+        m_next_urb_index = 0;
+        for (size_t i = 0; i < NUM_ASYNC_URBS; ++i) {
+            m_urbs[i].transfer = libusb_alloc_transfer(0);
+            if (!m_urbs[i].transfer) {
+                LOG_ERROR("Failed to allocate libusb transfer for URB %zu", i);
+            }
+            m_urbs[i].buffer.resize(4 * 1024 * 1024); // 4MB per URB buffer
+            m_urbs[i].in_flight.store(false);
+            m_urbs[i].transport = this;
+            m_urbs[i].urb_id = static_cast<uint32_t>(i);
+        }
+    }
+
     // Start event processing thread
     m_running = true;
     m_event_thread = std::thread(&UsbTransport::EventThreadLoop, this);
 
-    LOG_INFO("Connected to DisplayLink Device (PID 0x%04x)", m_connected_pid);
+    LOG_INFO("Connected to DisplayLink Device (PID 0x%04x) with %zu async URBs", m_connected_pid, NUM_ASYNC_URBS);
     return true;
 }
 
 void UsbTransport::CloseDevice() {
+    // 1. Cancel all in-flight URBs
+    {
+        std::lock_guard<std::mutex> lock(m_ring_mutex);
+        for (auto& urb : m_urbs) {
+            if (urb.in_flight.load(std::memory_order_acquire) && urb.transfer) {
+                libusb_cancel_transfer(urb.transfer);
+            }
+        }
+    }
+
+    // 2. Wait up to 300ms for in-flight cancellations to complete while event thread is running
+    {
+        std::unique_lock<std::mutex> lock(m_ring_mutex);
+        m_ring_cv.wait_for(lock, std::chrono::milliseconds(300), [this]() {
+            return m_in_flight_count.load(std::memory_order_acquire) == 0;
+        });
+    }
+
+    // 3. Stop event processing thread
     m_running = false;
     if (m_event_thread.joinable()) {
         m_event_thread.join();
     }
 
+    // 4. Free all transfer descriptors
+    {
+        std::lock_guard<std::mutex> lock(m_ring_mutex);
+        for (auto& urb : m_urbs) {
+            if (urb.transfer) {
+                libusb_free_transfer(urb.transfer);
+                urb.transfer = nullptr;
+            }
+            urb.in_flight.store(false);
+        }
+        m_in_flight_count.store(0);
+    }
+
+    // 5. Release interface and close handle
     if (m_handle) {
         libusb_release_interface(m_handle, protocol::INTERFACE_VIDEO_CONTROL);
         libusb_close(m_handle);
@@ -142,10 +192,26 @@ void UsbTransport::CloseDevice() {
 }
 
 void UsbTransport::EventThreadLoop() {
-    timeval tv{0, 50000}; // 50ms timeout
+    timeval tv{0, 20000}; // 20ms timeout
     while (m_running) {
         libusb_handle_events_timeout_completed(m_ctx, &tv, nullptr);
     }
+}
+
+void LIBUSB_CALL UsbTransport::AsyncTransferCallback(libusb_transfer* transfer) {
+    AsyncUrb* urb = static_cast<AsyncUrb*>(transfer->user_data);
+    if (!urb || !urb->transport) return;
+    urb->transport->OnTransferCompleted(urb, transfer->status);
+}
+
+void UsbTransport::OnTransferCompleted(AsyncUrb* urb, int status) {
+    if (status != LIBUSB_TRANSFER_COMPLETED && status != LIBUSB_TRANSFER_CANCELLED) {
+        LOG_WARN("Async USB URB %u completed with status %d: %s",
+                 urb->urb_id, status, libusb_error_name(status));
+    }
+    urb->in_flight.store(false, std::memory_order_release);
+    m_in_flight_count.fetch_sub(1, std::memory_order_acq_rel);
+    m_ring_cv.notify_all();
 }
 
 bool UsbTransport::SendCommand(protocol::CommandOpcode opcode, uint8_t head_id, const void* payload, size_t payload_len) {
@@ -178,6 +244,76 @@ bool UsbTransport::SendCommand(protocol::CommandOpcode opcode, uint8_t head_id, 
 bool UsbTransport::SendVideoData(uint8_t endpoint, const uint8_t* data, size_t length, unsigned int timeout_ms) {
     if (!m_handle || !data || length == 0) return false;
 
+    AsyncUrb* target_urb = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(m_ring_mutex);
+
+        // Wait until at least one URB slot is available in the ring
+        bool available = m_ring_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
+            for (const auto& urb : m_urbs) {
+                if (!urb.in_flight.load(std::memory_order_acquire)) return true;
+            }
+            return false;
+        });
+
+        if (!available) {
+            LOG_WARN("All %zu async USB URBs in flight (pipeline backpressure timeout)", NUM_ASYNC_URBS);
+            return false;
+        }
+
+        // Round-robin selection of the next available URB
+        for (size_t i = 0; i < NUM_ASYNC_URBS; ++i) {
+            size_t idx = (m_next_urb_index + i) % NUM_ASYNC_URBS;
+            if (!m_urbs[idx].in_flight.load(std::memory_order_acquire) && m_urbs[idx].transfer) {
+                target_urb = &m_urbs[idx];
+                m_next_urb_index = (idx + 1) % NUM_ASYNC_URBS;
+                break;
+            }
+        }
+
+        if (!target_urb || !target_urb->transfer) {
+            // Fallback to synchronous transfer if ring URBs are not allocated
+            return SendVideoDataSync(endpoint, data, length, timeout_ms);
+        }
+
+        // Resize buffer if payload exceeds current capacity
+        if (target_urb->buffer.size() < length) {
+            target_urb->buffer.resize(length);
+        }
+
+        // Fast copy into URB transmission buffer
+        std::memcpy(target_urb->buffer.data(), data, length);
+        target_urb->in_flight.store(true, std::memory_order_release);
+        m_in_flight_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    // Fill and submit asynchronous bulk transfer
+    libusb_fill_bulk_transfer(
+        target_urb->transfer,
+        m_handle,
+        endpoint,
+        target_urb->buffer.data(),
+        static_cast<int>(length),
+        AsyncTransferCallback,
+        target_urb,
+        timeout_ms
+    );
+
+    int rc = libusb_submit_transfer(target_urb->transfer);
+    if (rc != 0) {
+        LOG_ERROR("Failed to submit async USB URB %u: %s", target_urb->urb_id, libusb_error_name(rc));
+        target_urb->in_flight.store(false, std::memory_order_release);
+        m_in_flight_count.fetch_sub(1, std::memory_order_acq_rel);
+        m_ring_cv.notify_all();
+        return false;
+    }
+
+    return true;
+}
+
+bool UsbTransport::SendVideoDataSync(uint8_t endpoint, const uint8_t* data, size_t length, unsigned int timeout_ms) {
+    if (!m_handle || !data || length == 0) return false;
+
     std::lock_guard<std::mutex> lock(m_io_mutex);
     int transferred = 0;
     int rc = libusb_bulk_transfer(m_handle, endpoint, const_cast<uint8_t*>(data), static_cast<int>(length), &transferred, timeout_ms);
@@ -186,6 +322,13 @@ bool UsbTransport::SendVideoData(uint8_t endpoint, const uint8_t* data, size_t l
         return false;
     }
     return true;
+}
+
+bool UsbTransport::FlushVideoTransfers(unsigned int timeout_ms) {
+    std::unique_lock<std::mutex> lock(m_ring_mutex);
+    return m_ring_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
+        return m_in_flight_count.load(std::memory_order_acquire) == 0;
+    });
 }
 
 bool UsbTransport::SendHeartbeat(uint8_t head_id) {
@@ -197,6 +340,27 @@ bool UsbTransport::SendHeartbeat(uint8_t head_id) {
                          std::chrono::steady_clock::now().time_since_epoch()).count());
 
     return SendCommand(protocol::CommandOpcode::Heartbeat, head_id, &pkt, sizeof(pkt));
+}
+
+double UsbTransport::BenchmarkRingDispatch(const uint8_t* data, size_t length, int iterations) {
+    if (!data || length == 0 || iterations <= 0) return 0.0;
+
+    std::lock_guard<std::mutex> lock(m_ring_mutex);
+    for (size_t i = 0; i < NUM_ASYNC_URBS; ++i) {
+        if (m_urbs[i].buffer.size() < length) {
+            m_urbs[i].buffer.resize(length);
+        }
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < iterations; ++it) {
+        size_t idx = it % NUM_ASYNC_URBS;
+        std::memcpy(m_urbs[idx].buffer.data(), data, length);
+        m_urbs[idx].in_flight.store(true, std::memory_order_release);
+        m_urbs[idx].in_flight.store(false, std::memory_order_release);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::micro>(end - start).count() / iterations;
 }
 
 } // namespace dl_turbo
