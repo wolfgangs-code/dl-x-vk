@@ -31,8 +31,9 @@ layout(std430, binding = 3) writeonly buffer PacketOutput {
     uint8_t packet_data[];
 };
 
-shared uint s_tile_pixels[32 * 32];
-shared uint s_row_comp[32 * 40];
+// 33 and 41 strides eliminate all 32-way and 8-way LDS bank conflicts
+shared uint s_tile_pixels[32 * 33];
+shared uint s_row_comp[32 * 41];
 shared uint s_row_len[32];
 shared uint s_row_offset[32];
 shared uint s_tile_payload_len;
@@ -54,27 +55,27 @@ void main() {
 
     uint r = gl_LocalInvocationID.x; // Thread index 0..31
 
-    // Step 1: Fully coalesced parallel tile ingestion from global memory to LDS
+    // Step 1: Fully coalesced parallel tile ingestion from global memory to LDS (Bank-padded stride 33)
     uint row_base_offset = tile_y * pc.stride_words + tile_x + r;
     uint gy_stride = pc.stride_words;
     if (r < tile_w) {
         for (uint k = 0; k < tile_h; ++k) {
-            s_tile_pixels[k * 32 + r] = curr_pixels[row_base_offset + k * gy_stride];
+            s_tile_pixels[k * 33 + r] = curr_pixels[row_base_offset + k * gy_stride];
         }
     } else {
         for (uint k = 0; k < tile_h; ++k) {
-            s_tile_pixels[k * 32 + r] = 0u;
+            s_tile_pixels[k * 33 + r] = 0u;
         }
     }
     barrier();
 
-    // Step 2: High-speed RLE compression on LDS memory with register word packing
+    // Step 2: High-speed RLE compression on LDS memory with conflict-free banks
     if (r < tile_h) {
-        uint row_words_base = r * 32;
+        uint row_words_base = r * 33;
         uint row_bytes = tile_w * 4;
         uint src_idx = 0;
 
-        uint row_buf_base = r * 40;
+        uint row_buf_base = r * 41;
         uint out_words = 0;
         uint cur_word = 0;
         uint cur_byte_count = 0;
@@ -94,7 +95,6 @@ void main() {
             }
 
             if (count > 3 || byte_val == 0x55u) {
-                // DL escape sequence: 0x55, count, byte_val
                 if (cur_byte_count == 0u) {
                     cur_word = 0x55u | (count << 8u) | (byte_val << 16u);
                     cur_byte_count = 3u;
@@ -108,7 +108,7 @@ void main() {
                     s_row_comp[row_buf_base + out_words++] = cur_word;
                     cur_word = byte_val;
                     cur_byte_count = 1u;
-                } else { // cur_byte_count == 3u
+                } else {
                     cur_word |= (0x55u << 24u);
                     s_row_comp[row_buf_base + out_words++] = cur_word;
                     cur_word = count | (byte_val << 8u);
@@ -164,21 +164,16 @@ void main() {
     // Step 4: Thread 0 writes the 14-byte packed TileDescriptorHeader
     if (r == 0) {
         uint pos = s_out_pos;
-        // x (uint16), y (uint16)
         packet_data[pos + 0] = uint8_t(tile_x & 0xFFu);
         packet_data[pos + 1] = uint8_t((tile_x >> 8u) & 0xFFu);
         packet_data[pos + 2] = uint8_t(tile_y & 0xFFu);
         packet_data[pos + 3] = uint8_t((tile_y >> 8u) & 0xFFu);
-        // width (uint16), height (uint16)
         packet_data[pos + 4] = uint8_t(tile_w & 0xFFu);
         packet_data[pos + 5] = uint8_t((tile_w >> 8u) & 0xFFu);
         packet_data[pos + 6] = uint8_t(tile_h & 0xFFu);
         packet_data[pos + 7] = uint8_t((tile_h >> 8u) & 0xFFu);
-        // compression (uint8: 0x00=Raw, 0x01=RLE)
         packet_data[pos + 8] = uint8_t(s_comp_type);
-        // flags (uint8: bit 0 = lossless)
         packet_data[pos + 9] = uint8_t(0x01);
-        // compressed_bytes (uint32)
         packet_data[pos + 10] = uint8_t(s_tile_payload_len & 0xFFu);
         packet_data[pos + 11] = uint8_t((s_tile_payload_len >> 8u) & 0xFFu);
         packet_data[pos + 12] = uint8_t((s_tile_payload_len >> 16u) & 0xFFu);
@@ -190,11 +185,10 @@ void main() {
         if (r < tile_h) {
             uint dest_base = s_out_pos + 14 + s_row_offset[r];
             uint len = s_row_len[r];
-            uint row_buf_base = r * 40;
+            uint row_buf_base = r * 41;
             uint w_count = len >> 2;
             uint rem = len & 3u;
 
-            // Write 32-bit words unpacked into 4-byte bursts with single LDS fetch per word
             for (uint w = 0; w < w_count; ++w) {
                 uint word = s_row_comp[row_buf_base + w];
                 uint base = dest_base + (w << 2);
@@ -214,7 +208,7 @@ void main() {
     } else {
         if (r < tile_h) {
             uint dest_base = s_out_pos + 14 + r * (tile_w * 4);
-            uint row_words_base = r * 32;
+            uint row_words_base = r * 33;
             for (uint px = 0; px < tile_w; ++px) {
                 uint word = s_tile_pixels[row_words_base + px];
                 uint base = dest_base + (px << 2);
