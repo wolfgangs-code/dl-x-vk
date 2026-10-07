@@ -88,8 +88,12 @@ public:
         int tile_size,
         uint32_t frame_index,
         uint32_t& out_total_packet_bytes,
-        const std::vector<DirtyRect>& dirty_rects = {}
+        const std::vector<DirtyRect>& dirty_rects = {},
+        bool pipelined = false
     );
+
+    // Flush any pending in-flight pipelined frame
+    const uint8_t* FlushFramePacketsGpu(uint32_t& out_total_packet_bytes);
 
     uint32_t GetDirtyTileCount() const;
     const uint32_t* GetDirtyTileIndices() const;
@@ -145,8 +149,8 @@ private:
     VkDescriptorSet m_comp_desc_set[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     VkCommandPool m_cmd_pool = VK_NULL_HANDLE;
-    VkCommandBuffer m_cmd_buffer = VK_NULL_HANDLE;
-    VkFence m_fence = VK_NULL_HANDLE;
+    VkCommandBuffer m_cmd_buffer[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkFence m_fence[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     // Buffers
     VulkanBuffer m_buf_input[2]; // Double-buffered mapped input for zero-copy EVDI ingestion
@@ -154,15 +158,22 @@ private:
     VulkanBuffer m_buf_u;
     VulkanBuffer m_buf_v;
 
-    VulkanBuffer m_buf_diff_ref;   // Previous frame stored in GPU Device Local memory
-    VulkanBuffer m_buf_diff_mask;  // 1-bit per tile dirty bitmask
-    VulkanBuffer m_buf_diff_list;  // Atomic dirty count + uint32 dirty tile indices
+    VulkanBuffer m_buf_diff_ref;      // Previous frame stored in GPU Device Local memory
+    VulkanBuffer m_buf_diff_mask[2];  // 1-bit per tile dirty bitmask (double-buffered)
+    VulkanBuffer m_buf_diff_list[2];  // Atomic dirty count + uint32 dirty tile indices (double-buffered)
     uint32_t m_diff_total_tiles = 0;
 
-    VulkanBuffer m_buf_packet_meta; // uint32 total_packet_bytes atomic counter
-    VulkanBuffer m_buf_packet_out;  // Contiguous USB packet payload (Host-Cached)
-    VulkanBuffer m_buf_indirect;    // VkDispatchIndirectCommand for GPU indirect dispatch
+    VulkanBuffer m_buf_packet_meta[2]; // uint32 total_packet_bytes atomic counter (double-buffered)
+    VulkanBuffer m_buf_packet_out[2];  // Contiguous USB packet payload (Host-Cached, double-buffered)
+    VulkanBuffer m_buf_indirect[2];    // VkDispatchIndirectCommand for GPU indirect dispatch (double-buffered)
     size_t m_packet_capacity = 0;
+
+    // Asynchronous double-buffered pipelining state
+    int m_in_flight_slot = -1;
+    uint32_t m_in_flight_frame_index = 0;
+    int m_in_flight_width = 0;
+    int m_in_flight_height = 0;
+    bool m_in_flight = false;
 };
 
 } // namespace dl_turbo

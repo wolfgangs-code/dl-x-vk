@@ -146,6 +146,25 @@ void RunBenchmark() {
 
             LOG_INFO("  Direct EVDI Zero-Copy Buffer Ingestion (100 Dirty Tiles): %d passes in %.2f ms", DIRTY_BENCH_PASSES, zc_ms);
             LOG_INFO("  Zero-Copy Throughput: %.2f FPS (%.2f ms/frame)", (DIRTY_BENCH_PASSES * 1000.0) / zc_ms, zc_ms / DIRTY_BENCH_PASSES);
+
+            // 5b. Pipelined Asynchronous Ingestion (Decoupled GPU/CPU Overlap)
+            auto start_zc_pipe = std::chrono::high_resolution_clock::now();
+            for (int p = 0; p < DIRTY_BENCH_PASSES; ++p) {
+                uint8_t* cur_mapped = (p % 2 == 0) ? mapped_fb0 : mapped_fb1;
+                for (int t = 0; t < 100; ++t) {
+                    int px = (t % 10) * 32;
+                    int py = (t / 10) * 32;
+                    cur_mapped[(py * WIDTH + px) * 4] ^= static_cast<uint8_t>(p + 1);
+                }
+                vk.EncodeFramePacketsGpu(cur_mapped, WIDTH * 4, WIDTH, HEIGHT, 32, p + 200, total_packet_bytes, dirty_rects, true);
+            }
+            uint32_t flush_bytes = 0;
+            vk.FlushFramePacketsGpu(flush_bytes);
+            auto end_zc_pipe = std::chrono::high_resolution_clock::now();
+            double zc_pipe_ms = std::chrono::duration<double, std::milli>(end_zc_pipe - start_zc_pipe).count();
+
+            LOG_INFO("  Pipelined Double-Buffered Overlap Ingestion: %d passes in %.2f ms", DIRTY_BENCH_PASSES, zc_pipe_ms);
+            LOG_INFO("  Pipelined Zero-Copy Throughput: %.2f FPS (%.2f ms/frame)", (DIRTY_BENCH_PASSES * 1000.0) / zc_pipe_ms, zc_pipe_ms / DIRTY_BENCH_PASSES);
         }
 
         // 6. USB Transport Layer Pipeline Evaluation (Synchronous vs Async Multi-URB Ring Queue)

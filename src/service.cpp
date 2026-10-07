@@ -84,7 +84,19 @@ void DisplayLinkService::Stop() {
         m_evdi->Close();
     }
 
+    auto& vk = VulkanConverter::Instance();
+    if (vk.IsAvailable()) {
+        uint32_t flush_bytes = 0;
+        const uint8_t* last_packet = vk.FlushFramePacketsGpu(flush_bytes);
+        if (last_packet && flush_bytes > sizeof(protocol::FrameSectionHeader)) {
+            if (m_usb && m_usb->IsConnected()) {
+                m_usb->SendVideoData(protocol::EP_VIDEO_HEAD0, last_packet, flush_bytes);
+            }
+        }
+    }
+
     if (m_usb) {
+        m_usb->FlushVideoTransfers();
         m_usb->CloseDevice();
     }
 
@@ -140,7 +152,7 @@ void DisplayLinkService::OnFrameReady(
     if (vk.IsAvailable()) {
         uint32_t total_packet_bytes = 0;
         const uint8_t* packet_data = vk.EncodeFramePacketsGpu(
-            fb_data, stride, width, height, 32, m_frame_counter, total_packet_bytes, dirty_rects
+            fb_data, stride, width, height, 32, m_frame_counter, total_packet_bytes, dirty_rects, true
         );
 
         if (packet_data && total_packet_bytes > sizeof(protocol::FrameSectionHeader)) {

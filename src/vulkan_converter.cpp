@@ -200,8 +200,10 @@ bool VulkanConverter::EnsureDiffBuffers(size_t fb_size, uint32_t total_tiles) {
     if (m_buf_input[0].size >= fb_size &&
         m_buf_input[1].size >= fb_size &&
         m_buf_diff_ref.size >= fb_size &&
-        m_buf_diff_mask.size >= mask_size &&
-        m_buf_diff_list.size >= list_size) {
+        m_buf_diff_mask[0].size >= mask_size &&
+        m_buf_diff_mask[1].size >= mask_size &&
+        m_buf_diff_list[0].size >= list_size &&
+        m_buf_diff_list[1].size >= list_size) {
         return true;
     }
 
@@ -229,52 +231,53 @@ bool VulkanConverter::EnsureDiffBuffers(size_t fb_size, uint32_t total_tiles) {
 
         // Zero out initial reference frame
         VkCommandBufferBeginInfo cbbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr };
-        vkBeginCommandBuffer(m_cmd_buffer, &cbbi);
-        vkCmdFillBuffer(m_cmd_buffer, m_buf_diff_ref.buffer, 0, VK_WHOLE_SIZE, 0);
-        vkEndCommandBuffer(m_cmd_buffer);
+        vkBeginCommandBuffer(m_cmd_buffer[0], &cbbi);
+        vkCmdFillBuffer(m_cmd_buffer[0], m_buf_diff_ref.buffer, 0, VK_WHOLE_SIZE, 0);
+        vkEndCommandBuffer(m_cmd_buffer[0]);
 
-        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_cmd_buffer, 0, nullptr };
-        vkResetFences(m_device, 1, &m_fence);
-        vkQueueSubmit(m_compute_queue, 1, &si, m_fence);
-        vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX);
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_cmd_buffer[0], 0, nullptr };
+        vkResetFences(m_device, 1, &m_fence[0]);
+        vkQueueSubmit(m_compute_queue, 1, &si, m_fence[0]);
+        vkWaitForFences(m_device, 1, &m_fence[0], VK_TRUE, UINT64_MAX);
     }
 
-    // Allocate dirty bitmask buffer (Host Cached for ultra-fast reading)
-    if (m_buf_diff_mask.size < mask_size) {
-        DestroyBuffer(m_buf_diff_mask);
-        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, mask_size,
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
-        if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_diff_mask.buffer) != VK_SUCCESS) return false;
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(m_device, m_buf_diff_mask.buffer, &req);
-        uint32_t memType = FindMemoryType(req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
-        if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_diff_mask.memory) != VK_SUCCESS) return false;
-        vkBindBufferMemory(m_device, m_buf_diff_mask.buffer, m_buf_diff_mask.memory, 0);
-        vkMapMemory(m_device, m_buf_diff_mask.memory, 0, mask_size, 0, &m_buf_diff_mask.mapped);
-        m_buf_diff_mask.size = mask_size;
-    }
+    // Allocate double-buffered dirty bitmask and dirty list buffers
+    for (int b = 0; b < 2; b++) {
+        if (m_buf_diff_mask[b].size < mask_size) {
+            DestroyBuffer(m_buf_diff_mask[b]);
+            VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, mask_size,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+            if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_diff_mask[b].buffer) != VK_SUCCESS) return false;
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(m_device, m_buf_diff_mask[b].buffer, &req);
+            uint32_t memType = FindMemoryType(req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
+            if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_diff_mask[b].memory) != VK_SUCCESS) return false;
+            vkBindBufferMemory(m_device, m_buf_diff_mask[b].buffer, m_buf_diff_mask[b].memory, 0);
+            vkMapMemory(m_device, m_buf_diff_mask[b].memory, 0, mask_size, 0, &m_buf_diff_mask[b].mapped);
+            m_buf_diff_mask[b].size = mask_size;
+        }
 
-    // Allocate dirty list buffer
-    if (m_buf_diff_list.size < list_size) {
-        DestroyBuffer(m_buf_diff_list);
-        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, list_size,
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
-        if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_diff_list.buffer) != VK_SUCCESS) return false;
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(m_device, m_buf_diff_list.buffer, &req);
-        uint32_t memType = FindMemoryType(req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
-        if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_diff_list.memory) != VK_SUCCESS) return false;
-        vkBindBufferMemory(m_device, m_buf_diff_list.buffer, m_buf_diff_list.memory, 0);
-        vkMapMemory(m_device, m_buf_diff_list.memory, 0, list_size, 0, &m_buf_diff_list.mapped);
-        m_buf_diff_list.size = list_size;
+        if (m_buf_diff_list[b].size < list_size) {
+            DestroyBuffer(m_buf_diff_list[b]);
+            VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, list_size,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                       VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+            if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_diff_list[b].buffer) != VK_SUCCESS) return false;
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(m_device, m_buf_diff_list[b].buffer, &req);
+            uint32_t memType = FindMemoryType(req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
+            if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_diff_list[b].memory) != VK_SUCCESS) return false;
+            vkBindBufferMemory(m_device, m_buf_diff_list[b].buffer, m_buf_diff_list[b].memory, 0);
+            vkMapMemory(m_device, m_buf_diff_list[b].memory, 0, list_size, 0, &m_buf_diff_list[b].mapped);
+            m_buf_diff_list[b].size = list_size;
+        }
     }
 
     m_diff_total_tiles = total_tiles;
@@ -282,10 +285,10 @@ bool VulkanConverter::EnsureDiffBuffers(size_t fb_size, uint32_t total_tiles) {
     // Update differencing descriptor sets for both double-buffered inputs
     for (int b = 0; b < 2; b++) {
         VkDescriptorBufferInfo dbi[4] = {
-            { m_buf_input[b].buffer,  0, fb_size },
-            { m_buf_diff_ref.buffer,  0, fb_size },
-            { m_buf_diff_mask.buffer, 0, mask_size },
-            { m_buf_diff_list.buffer, 0, list_size }
+            { m_buf_input[b].buffer,     0, fb_size },
+            { m_buf_diff_ref.buffer,     0, fb_size },
+            { m_buf_diff_mask[b].buffer, 0, mask_size },
+            { m_buf_diff_list[b].buffer, 0, list_size }
         };
 
         VkWriteDescriptorSet writes[4] = {};
@@ -543,7 +546,7 @@ bool VulkanConverter::Initialize() {
         return false;
     }
 
-    // 8. Command Pool & Command Buffer & Fence
+    // 8. Command Pool & Command Buffers & Fences (Double-Buffered)
     VkCommandPoolCreateInfo cmdPoolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
                                             VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, m_compute_queue_family };
     if (vkCreateCommandPool(m_device, &cmdPoolInfo, nullptr, &m_cmd_pool) != VK_SUCCESS) {
@@ -553,18 +556,20 @@ bool VulkanConverter::Initialize() {
     }
 
     VkCommandBufferAllocateInfo cmdAllocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr,
-                                                 m_cmd_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
-    if (vkAllocateCommandBuffers(m_device, &cmdAllocInfo, &m_cmd_buffer) != VK_SUCCESS) {
-        LOG_ERROR("Failed to allocate command buffer");
+                                                 m_cmd_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2 };
+    if (vkAllocateCommandBuffers(m_device, &cmdAllocInfo, m_cmd_buffer) != VK_SUCCESS) {
+        LOG_ERROR("Failed to allocate command buffers");
         Cleanup();
         return false;
     }
 
     VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT };
-    if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_fence) != VK_SUCCESS) {
-        LOG_ERROR("Failed to create Vulkan fence");
-        Cleanup();
-        return false;
+    for (int i = 0; i < 2; i++) {
+        if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_fence[i]) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create Vulkan fence %d", i);
+            Cleanup();
+            return false;
+        }
     }
 
     m_initialized = true;
@@ -582,12 +587,19 @@ void VulkanConverter::Cleanup() {
         DestroyBuffer(m_buf_u);
         DestroyBuffer(m_buf_v);
         DestroyBuffer(m_buf_diff_ref);
-        DestroyBuffer(m_buf_diff_mask);
-        DestroyBuffer(m_buf_diff_list);
-        DestroyBuffer(m_buf_packet_meta);
-        DestroyBuffer(m_buf_packet_out);
-        DestroyBuffer(m_buf_indirect);
+        DestroyBuffer(m_buf_diff_mask[0]);
+        DestroyBuffer(m_buf_diff_mask[1]);
+        DestroyBuffer(m_buf_diff_list[0]);
+        DestroyBuffer(m_buf_diff_list[1]);
+        DestroyBuffer(m_buf_packet_meta[0]);
+        DestroyBuffer(m_buf_packet_meta[1]);
+        DestroyBuffer(m_buf_packet_out[0]);
+        DestroyBuffer(m_buf_packet_out[1]);
+        DestroyBuffer(m_buf_indirect[0]);
+        DestroyBuffer(m_buf_indirect[1]);
         m_packet_capacity = 0;
+        m_in_flight = false;
+        m_in_flight_slot = -1;
 
         m_desc_set[0] = VK_NULL_HANDLE;
         m_desc_set[1] = VK_NULL_HANDLE;
@@ -596,7 +608,9 @@ void VulkanConverter::Cleanup() {
         m_comp_desc_set[0] = VK_NULL_HANDLE;
         m_comp_desc_set[1] = VK_NULL_HANDLE;
 
-        if (m_fence != VK_NULL_HANDLE) { vkDestroyFence(m_device, m_fence, nullptr); m_fence = VK_NULL_HANDLE; }
+        for (int i = 0; i < 2; i++) {
+            if (m_fence[i] != VK_NULL_HANDLE) { vkDestroyFence(m_device, m_fence[i], nullptr); m_fence[i] = VK_NULL_HANDLE; }
+        }
         if (m_cmd_pool != VK_NULL_HANDLE) { vkDestroyCommandPool(m_device, m_cmd_pool, nullptr); m_cmd_pool = VK_NULL_HANDLE; }
         if (m_desc_pool != VK_NULL_HANDLE) { vkDestroyDescriptorPool(m_device, m_desc_pool, nullptr); m_desc_pool = VK_NULL_HANDLE; }
 
@@ -654,22 +668,22 @@ bool VulkanConverter::DispatchCompute(int width, int height, int src_stride, int
     };
 
     VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr };
-    if (vkBeginCommandBuffer(m_cmd_buffer, &beginInfo) != VK_SUCCESS) return false;
+    if (vkBeginCommandBuffer(m_cmd_buffer[0], &beginInfo) != VK_SUCCESS) return false;
 
-    vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline_layout, 0, 1, &m_desc_set[0], 0, nullptr);
-    vkCmdPushConstants(m_cmd_buffer, m_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdBindPipeline(m_cmd_buffer[0], VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
+    vkCmdBindDescriptorSets(m_cmd_buffer[0], VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline_layout, 0, 1, &m_desc_set[0], 0, nullptr);
+    vkCmdPushConstants(m_cmd_buffer[0], m_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
     uint32_t group_x = ((width + 1) / 2 + 15) / 16;
     uint32_t group_y = ((height + 1) / 2 + 15) / 16;
-    vkCmdDispatch(m_cmd_buffer, group_x, group_y, 1);
+    vkCmdDispatch(m_cmd_buffer[0], group_x, group_y, 1);
 
-    if (vkEndCommandBuffer(m_cmd_buffer) != VK_SUCCESS) return false;
+    if (vkEndCommandBuffer(m_cmd_buffer[0]) != VK_SUCCESS) return false;
 
-    vkResetFences(m_device, 1, &m_fence);
-    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_cmd_buffer, 0, nullptr };
-    if (vkQueueSubmit(m_compute_queue, 1, &submitInfo, m_fence) != VK_SUCCESS) return false;
-    if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    vkResetFences(m_device, 1, &m_fence[0]);
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_cmd_buffer[0], 0, nullptr };
+    if (vkQueueSubmit(m_compute_queue, 1, &submitInfo, m_fence[0]) != VK_SUCCESS) return false;
+    if (vkWaitForFences(m_device, 1, &m_fence[0], VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
 
     return true;
 }
@@ -744,51 +758,51 @@ bool VulkanConverter::DispatchTileDifferencing(
     };
 
     VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr };
-    if (vkBeginCommandBuffer(m_cmd_buffer, &beginInfo) != VK_SUCCESS) return false;
+    if (vkBeginCommandBuffer(m_cmd_buffer[0], &beginInfo) != VK_SUCCESS) return false;
 
     // Reset mask and counter on GPU
-    vkCmdFillBuffer(m_cmd_buffer, m_buf_diff_mask.buffer, 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(m_cmd_buffer, m_buf_diff_list.buffer, 0, sizeof(uint32_t), 0);
+    vkCmdFillBuffer(m_cmd_buffer[0], m_buf_diff_mask[0].buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(m_cmd_buffer[0], m_buf_diff_list[0].buffer, 0, sizeof(uint32_t), 0);
 
     VkMemoryBarrier mb_clear = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                  VK_ACCESS_TRANSFER_WRITE_BIT,
                                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
-    vkCmdPipelineBarrier(m_cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_clear, 0, nullptr, 0, nullptr);
+    vkCmdPipelineBarrier(m_cmd_buffer[0], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_clear, 0, nullptr, 0, nullptr);
 
-    vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set[0], 0, nullptr);
-    vkCmdPushConstants(m_cmd_buffer, m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdBindPipeline(m_cmd_buffer[0], VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
+    vkCmdBindDescriptorSets(m_cmd_buffer[0], VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set[0], 0, nullptr);
+    vkCmdPushConstants(m_cmd_buffer[0], m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    vkCmdDispatch(m_cmd_buffer, num_cols, num_rows, 1);
+    vkCmdDispatch(m_cmd_buffer[0], num_cols, num_rows, 1);
 
     VkMemoryBarrier mb_host = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                 VK_ACCESS_SHADER_WRITE_BIT,
                                 VK_ACCESS_HOST_READ_BIT };
-    vkCmdPipelineBarrier(m_cmd_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb_host, 0, nullptr, 0, nullptr);
+    vkCmdPipelineBarrier(m_cmd_buffer[0], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb_host, 0, nullptr, 0, nullptr);
 
-    if (vkEndCommandBuffer(m_cmd_buffer) != VK_SUCCESS) return false;
+    if (vkEndCommandBuffer(m_cmd_buffer[0]) != VK_SUCCESS) return false;
 
-    vkResetFences(m_device, 1, &m_fence);
-    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_cmd_buffer, 0, nullptr };
-    if (vkQueueSubmit(m_compute_queue, 1, &submitInfo, m_fence) != VK_SUCCESS) return false;
-    if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    vkResetFences(m_device, 1, &m_fence[0]);
+    VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &m_cmd_buffer[0], 0, nullptr };
+    if (vkQueueSubmit(m_compute_queue, 1, &submitInfo, m_fence[0]) != VK_SUCCESS) return false;
+    if (vkWaitForFences(m_device, 1, &m_fence[0], VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
 
     return true;
 }
 
 uint32_t VulkanConverter::GetDirtyTileCount() const {
-    if (!m_buf_diff_list.mapped) return 0;
-    return *static_cast<const uint32_t*>(m_buf_diff_list.mapped);
+    if (!m_buf_diff_list[0].mapped) return 0;
+    return *static_cast<const uint32_t*>(m_buf_diff_list[0].mapped);
 }
 
 const uint32_t* VulkanConverter::GetDirtyTileIndices() const {
-    if (!m_buf_diff_list.mapped) return nullptr;
-    return static_cast<const uint32_t*>(m_buf_diff_list.mapped) + 1;
+    if (!m_buf_diff_list[0].mapped) return nullptr;
+    return static_cast<const uint32_t*>(m_buf_diff_list[0].mapped) + 1;
 }
 
 const uint32_t* VulkanConverter::GetDirtyBitmask() const {
-    if (!m_buf_diff_mask.mapped) return nullptr;
-    return static_cast<const uint32_t*>(m_buf_diff_mask.mapped);
+    if (!m_buf_diff_mask[0].mapped) return nullptr;
+    return static_cast<const uint32_t*>(m_buf_diff_mask[0].mapped);
 }
 
 bool VulkanConverter::DetectDirtyTiles(
@@ -897,18 +911,21 @@ void VulkanConverter::UpdateCompDescriptors() {
     if (m_comp_desc_set[0] == VK_NULL_HANDLE ||
         m_buf_input[0].buffer == VK_NULL_HANDLE ||
         m_buf_input[1].buffer == VK_NULL_HANDLE ||
-        m_buf_diff_list.buffer == VK_NULL_HANDLE ||
-        m_buf_packet_meta.buffer == VK_NULL_HANDLE ||
-        m_buf_packet_out.buffer == VK_NULL_HANDLE) {
+        m_buf_diff_list[0].buffer == VK_NULL_HANDLE ||
+        m_buf_diff_list[1].buffer == VK_NULL_HANDLE ||
+        m_buf_packet_meta[0].buffer == VK_NULL_HANDLE ||
+        m_buf_packet_meta[1].buffer == VK_NULL_HANDLE ||
+        m_buf_packet_out[0].buffer == VK_NULL_HANDLE ||
+        m_buf_packet_out[1].buffer == VK_NULL_HANDLE) {
         return;
     }
 
     for (int b = 0; b < 2; b++) {
         VkDescriptorBufferInfo dbi[4] = {
-            { m_buf_input[b].buffer,    0, m_buf_input[b].size },
-            { m_buf_diff_list.buffer,   0, m_buf_diff_list.size },
-            { m_buf_packet_meta.buffer, 0, m_buf_packet_meta.size },
-            { m_buf_packet_out.buffer,  0, m_buf_packet_out.size }
+            { m_buf_input[b].buffer,       0, m_buf_input[b].size },
+            { m_buf_diff_list[b].buffer,   0, m_buf_diff_list[b].size },
+            { m_buf_packet_meta[b].buffer, 0, m_buf_packet_meta[b].size },
+            { m_buf_packet_out[b].buffer,  0, m_buf_packet_out[b].size }
         };
 
         VkWriteDescriptorSet writes[4] = {};
@@ -928,75 +945,77 @@ void VulkanConverter::UpdateCompDescriptors() {
 bool VulkanConverter::EnsurePacketBuffers(size_t max_capacity) {
     bool updated = false;
 
-    // Allocate PacketMeta buffer (64 bytes for uint32 atomic counter)
-    if (m_buf_packet_meta.buffer == VK_NULL_HANDLE) {
-        size_t meta_size = 64;
-        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, meta_size,
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
-        if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_packet_meta.buffer) != VK_SUCCESS) return false;
+    for (int b = 0; b < 2; b++) {
+        // Allocate PacketMeta buffer (64 bytes for uint32 atomic counter)
+        if (m_buf_packet_meta[b].buffer == VK_NULL_HANDLE) {
+            size_t meta_size = 64;
+            VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, meta_size,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+            if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_packet_meta[b].buffer) != VK_SUCCESS) return false;
 
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(m_device, m_buf_packet_meta.buffer, &req);
-        uint32_t memType = FindMemoryType(req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
-        if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_packet_meta.memory) != VK_SUCCESS) return false;
-        vkBindBufferMemory(m_device, m_buf_packet_meta.buffer, m_buf_packet_meta.memory, 0);
-        vkMapMemory(m_device, m_buf_packet_meta.memory, 0, meta_size, 0, &m_buf_packet_meta.mapped);
-        m_buf_packet_meta.size = meta_size;
-        updated = true;
-    }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(m_device, m_buf_packet_meta[b].buffer, &req);
+            uint32_t memType = FindMemoryType(req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
+            if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_packet_meta[b].memory) != VK_SUCCESS) return false;
+            vkBindBufferMemory(m_device, m_buf_packet_meta[b].buffer, m_buf_packet_meta[b].memory, 0);
+            vkMapMemory(m_device, m_buf_packet_meta[b].memory, 0, meta_size, 0, &m_buf_packet_meta[b].mapped);
+            m_buf_packet_meta[b].size = meta_size;
+            updated = true;
+        }
 
-    // Allocate PacketOutput buffer (Host Cached for max read throughput)
-    if (m_buf_packet_out.size < max_capacity || m_buf_packet_out.buffer == VK_NULL_HANDLE) {
-        size_t alloc_size = std::max(max_capacity, size_t(36 * 1024 * 1024)); // Default to 36MB for 4K
-        DestroyBuffer(m_buf_packet_out);
+        // Allocate PacketOutput buffer (Host Cached for max read throughput)
+        if (m_buf_packet_out[b].size < max_capacity || m_buf_packet_out[b].buffer == VK_NULL_HANDLE) {
+            size_t alloc_size = std::max(max_capacity, size_t(36 * 1024 * 1024)); // Default to 36MB for 4K
+            DestroyBuffer(m_buf_packet_out[b]);
 
-        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, alloc_size,
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
-        if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_packet_out.buffer) != VK_SUCCESS) return false;
+            VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, alloc_size,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                       VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+            if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_packet_out[b].buffer) != VK_SUCCESS) return false;
 
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(m_device, m_buf_packet_out.buffer, &req);
-        uint32_t memType = FindMemoryType(req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
-        if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_packet_out.memory) != VK_SUCCESS) return false;
-        vkBindBufferMemory(m_device, m_buf_packet_out.buffer, m_buf_packet_out.memory, 0);
-        vkMapMemory(m_device, m_buf_packet_out.memory, 0, alloc_size, 0, &m_buf_packet_out.mapped);
-        m_buf_packet_out.size = alloc_size;
-        m_packet_capacity = alloc_size;
-        updated = true;
-    }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(m_device, m_buf_packet_out[b].buffer, &req);
+            uint32_t memType = FindMemoryType(req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
+            if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_packet_out[b].memory) != VK_SUCCESS) return false;
+            vkBindBufferMemory(m_device, m_buf_packet_out[b].buffer, m_buf_packet_out[b].memory, 0);
+            vkMapMemory(m_device, m_buf_packet_out[b].memory, 0, alloc_size, 0, &m_buf_packet_out[b].mapped);
+            m_buf_packet_out[b].size = alloc_size;
+            m_packet_capacity = alloc_size;
+            updated = true;
+        }
 
-    // Allocate Indirect Dispatch buffer (VkDispatchIndirectCommand { uint32_t x, y, z; })
-    if (m_buf_indirect.buffer == VK_NULL_HANDLE) {
-        size_t ind_size = 64;
-        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, ind_size,
-                                   VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                   VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
-        if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_indirect.buffer) != VK_SUCCESS) return false;
+        // Allocate Indirect Dispatch buffer (VkDispatchIndirectCommand { uint32_t x, y, z; })
+        if (m_buf_indirect[b].buffer == VK_NULL_HANDLE) {
+            size_t ind_size = 64;
+            VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, ind_size,
+                                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                       VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+            if (vkCreateBuffer(m_device, &bci, nullptr, &m_buf_indirect[b].buffer) != VK_SUCCESS) return false;
 
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(m_device, m_buf_indirect.buffer, &req);
-        uint32_t memType = FindMemoryType(req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
-        if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_indirect.memory) != VK_SUCCESS) return false;
-        vkBindBufferMemory(m_device, m_buf_indirect.buffer, m_buf_indirect.memory, 0);
-        vkMapMemory(m_device, m_buf_indirect.memory, 0, ind_size, 0, &m_buf_indirect.mapped);
-        m_buf_indirect.size = ind_size;
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(m_device, m_buf_indirect[b].buffer, &req);
+            uint32_t memType = FindMemoryType(req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, memType };
+            if (vkAllocateMemory(m_device, &ai, nullptr, &m_buf_indirect[b].memory) != VK_SUCCESS) return false;
+            vkBindBufferMemory(m_device, m_buf_indirect[b].buffer, m_buf_indirect[b].memory, 0);
+            vkMapMemory(m_device, m_buf_indirect[b].memory, 0, ind_size, 0, &m_buf_indirect[b].mapped);
+            m_buf_indirect[b].size = ind_size;
 
-        uint32_t* ind_ptr = static_cast<uint32_t*>(m_buf_indirect.mapped);
-        ind_ptr[0] = 0; // x = 0
-        ind_ptr[1] = 1; // y = 1
-        ind_ptr[2] = 1; // z = 1
-        updated = true;
+            uint32_t* ind_ptr = static_cast<uint32_t*>(m_buf_indirect[b].mapped);
+            ind_ptr[0] = 0; // x = 0
+            ind_ptr[1] = 1; // y = 1
+            ind_ptr[2] = 1; // z = 1
+            updated = true;
+        }
     }
 
     if (updated) {
@@ -1006,7 +1025,7 @@ bool VulkanConverter::EnsurePacketBuffers(size_t max_capacity) {
 }
 
 const uint8_t* VulkanConverter::GetMappedPacketBuffer() const {
-    return static_cast<const uint8_t*>(m_buf_packet_out.mapped);
+    return static_cast<const uint8_t*>(m_buf_packet_out[0].mapped);
 }
 
 const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
@@ -1017,7 +1036,8 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     int tile_size,
     uint32_t frame_index,
     uint32_t& out_total_packet_bytes,
-    const std::vector<DirtyRect>& dirty_rects
+    const std::vector<DirtyRect>& dirty_rects,
+    bool pipelined
 ) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized) return nullptr;
@@ -1032,7 +1052,58 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     size_t worst_case_bytes = 16 + static_cast<size_t>(total_tiles) * (14 + tile_size * tile_size * 4);
     if (!EnsurePacketBuffers(worst_case_bytes)) return nullptr;
 
-    UpdateCompDescriptors();
+    int slot = (curr_fb == m_buf_input[1].mapped) ? 1 : (curr_fb == m_buf_input[0].mapped) ? 0 : (frame_index % 2);
+
+    const uint8_t* ret_packet = nullptr;
+    out_total_packet_bytes = 0;
+
+    // In pipelined mode, retire the previously submitted frame from the other slot
+    if (pipelined && m_in_flight) {
+        int comp_slot = m_in_flight_slot;
+        if (vkWaitForFences(m_device, 1, &m_fence[comp_slot], VK_TRUE, UINT64_MAX) == VK_SUCCESS) {
+            VkMappedMemoryRange ranges[3] = {};
+            ranges[0].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            ranges[0].memory = m_buf_diff_list[comp_slot].memory;
+            ranges[0].offset = 0;
+            ranges[0].size = VK_WHOLE_SIZE;
+            ranges[1].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            ranges[1].memory = m_buf_packet_meta[comp_slot].memory;
+            ranges[1].offset = 0;
+            ranges[1].size = VK_WHOLE_SIZE;
+            ranges[2].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            ranges[2].memory = m_buf_packet_out[comp_slot].memory;
+            ranges[2].offset = 0;
+            ranges[2].size = VK_WHOLE_SIZE;
+            vkInvalidateMappedMemoryRanges(m_device, 3, ranges);
+
+            uint32_t comp_dirty_count = *reinterpret_cast<volatile uint32_t*>(m_buf_diff_list[comp_slot].mapped);
+            uint32_t comp_packet_bytes = *reinterpret_cast<volatile uint32_t*>(m_buf_packet_meta[comp_slot].mapped);
+
+            if (comp_dirty_count > 0 && comp_packet_bytes > sizeof(protocol::FrameSectionHeader)) {
+                protocol::FrameSectionHeader frame_hdr = {};
+                frame_hdr.magic         = protocol::DL_FRAME_MAGIC;
+                frame_hdr.frame_index   = m_in_flight_frame_index;
+                frame_hdr.screen_width  = static_cast<uint16_t>(m_in_flight_width);
+                frame_hdr.screen_height = static_cast<uint16_t>(m_in_flight_height);
+                frame_hdr.tile_count    = static_cast<uint16_t>(comp_dirty_count);
+                frame_hdr.head_id       = 0;
+                frame_hdr.reserved      = 0;
+
+                std::memcpy(m_buf_packet_out[comp_slot].mapped, &frame_hdr, sizeof(frame_hdr));
+
+                VkMappedMemoryRange flush_range = {};
+                flush_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                flush_range.memory = m_buf_packet_out[comp_slot].memory;
+                flush_range.offset = 0;
+                flush_range.size = sizeof(frame_hdr);
+                vkFlushMappedMemoryRanges(m_device, 1, &flush_range);
+
+                ret_packet = static_cast<const uint8_t*>(m_buf_packet_out[comp_slot].mapped);
+                out_total_packet_bytes = comp_packet_bytes;
+            }
+        }
+        m_in_flight = false;
+    }
 
     uint32_t start_col = 0;
     uint32_t start_row = 0;
@@ -1069,50 +1140,45 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         }
     }
 
-    int buf_idx = 0;
-    if (curr_fb == m_buf_input[0].mapped) {
-        buf_idx = 0; // Zero-copy: already inside GPU mapped input buffer 0!
-    } else if (curr_fb == m_buf_input[1].mapped) {
-        buf_idx = 1; // Zero-copy: already inside GPU mapped input buffer 1!
-    } else if (curr_fb) {
-        buf_idx = 0;
+    // Wait on slot fence before recording to guarantee GPU is done with previous frame on this slot
+    vkWaitForFences(m_device, 1, &m_fence[slot], VK_TRUE, UINT64_MAX);
+    vkResetFences(m_device, 1, &m_fence[slot]);
+
+    if (curr_fb != m_buf_input[slot].mapped && curr_fb) {
         if (has_bounds) {
-            // Fast Path: Only copy the rows covered by the dirty bounding box!
             uint32_t start_y = start_row * tile_size;
             uint32_t end_y = std::min((start_row + num_rows) * tile_size, static_cast<uint32_t>(height));
             size_t row_offset = static_cast<size_t>(start_y) * fb_stride;
             size_t copy_bytes = static_cast<size_t>(end_y - start_y) * fb_stride;
-            std::memcpy(static_cast<uint8_t*>(m_buf_input[0].mapped) + row_offset,
+            std::memcpy(static_cast<uint8_t*>(m_buf_input[slot].mapped) + row_offset,
                         curr_fb + row_offset, copy_bytes);
         } else {
-            std::memcpy(m_buf_input[0].mapped, curr_fb, fb_size);
+            std::memcpy(m_buf_input[slot].mapped, curr_fb, fb_size);
         }
     }
 
     int stride_words = fb_stride / 4;
 
-    // Reset command buffer for the unified single GPU submission
-    vkResetCommandBuffer(m_cmd_buffer, 0);
+    // Reset command buffer for slot
+    vkResetCommandBuffer(m_cmd_buffer[slot], 0);
     VkCommandBufferBeginInfo beginInfo = {
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
         VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr
     };
-    if (vkBeginCommandBuffer(m_cmd_buffer, &beginInfo) != VK_SUCCESS) return nullptr;
+    if (vkBeginCommandBuffer(m_cmd_buffer[slot], &beginInfo) != VK_SUCCESS) return nullptr;
 
     // 1. Clear GPU state buffers on the hardware timeline
-    vkCmdFillBuffer(m_cmd_buffer, m_buf_diff_mask.buffer, 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(m_cmd_buffer, m_buf_diff_list.buffer, 0, sizeof(uint32_t), 0);
-    vkCmdFillBuffer(m_cmd_buffer, m_buf_packet_meta.buffer, 0, sizeof(uint32_t), 16);
-
-    // Initialize m_buf_indirect (y=1, z=1)
-    vkCmdFillBuffer(m_cmd_buffer, m_buf_indirect.buffer, sizeof(uint32_t), sizeof(uint32_t) * 2, 1);
+    vkCmdFillBuffer(m_cmd_buffer[slot], m_buf_diff_mask[slot].buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(m_cmd_buffer[slot], m_buf_diff_list[slot].buffer, 0, sizeof(uint32_t), 0);
+    vkCmdFillBuffer(m_cmd_buffer[slot], m_buf_packet_meta[slot].buffer, 0, sizeof(uint32_t), 16);
+    vkCmdFillBuffer(m_cmd_buffer[slot], m_buf_indirect[slot].buffer, sizeof(uint32_t), sizeof(uint32_t) * 2, 1);
 
     VkMemoryBarrier mb_clear = {
         VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
         VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
     };
-    vkCmdPipelineBarrier(m_cmd_buffer,
+    vkCmdPipelineBarrier(m_cmd_buffer[slot],
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mb_clear, 0, nullptr, 0, nullptr);
@@ -1129,10 +1195,10 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         start_col,
         start_row
     };
-    vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set[buf_idx], 0, nullptr);
-    vkCmdPushConstants(m_cmd_buffer, m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(diff_pc), &diff_pc);
-    vkCmdDispatch(m_cmd_buffer, num_cols, num_rows, 1);
+    vkCmdBindPipeline(m_cmd_buffer[slot], VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
+    vkCmdBindDescriptorSets(m_cmd_buffer[slot], VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline_layout, 0, 1, &m_diff_desc_set[slot], 0, nullptr);
+    vkCmdPushConstants(m_cmd_buffer[slot], m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(diff_pc), &diff_pc);
+    vkCmdDispatch(m_cmd_buffer[slot], num_cols, num_rows, 1);
 
     // 3. Pipeline Barrier: Differencing -> Copy dirty_count to indirect buffer
     VkBufferMemoryBarrier b_copy = {};
@@ -1141,42 +1207,39 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     b_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     b_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b_copy.buffer = m_buf_diff_list.buffer;
+    b_copy.buffer = m_buf_diff_list[slot].buffer;
     b_copy.offset = 0;
     b_copy.size = sizeof(uint32_t);
 
-    vkCmdPipelineBarrier(m_cmd_buffer,
+    vkCmdPipelineBarrier(m_cmd_buffer[slot],
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 1, &b_copy, 0, nullptr);
 
-    // Copy dirty_count into m_buf_indirect.x
     VkBufferCopy copyRegion = { 0, 0, sizeof(uint32_t) };
-    vkCmdCopyBuffer(m_cmd_buffer, m_buf_diff_list.buffer, m_buf_indirect.buffer, 1, &copyRegion);
+    vkCmdCopyBuffer(m_cmd_buffer[slot], m_buf_diff_list[slot].buffer, m_buf_indirect[slot].buffer, 1, &copyRegion);
 
     // 4. Pipeline Barrier: Transfer & Diff write -> Indirect dispatch read & Compression read
     VkBufferMemoryBarrier b_after[2] = {};
-    // Indirect buffer: Transfer write -> Indirect command read
     b_after[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     b_after[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b_after[0].dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
     b_after[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b_after[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b_after[0].buffer = m_buf_indirect.buffer;
+    b_after[0].buffer = m_buf_indirect[slot].buffer;
     b_after[0].offset = 0;
     b_after[0].size = sizeof(uint32_t) * 3;
 
-    // DirtyList buffer: Compute write (tile IDs) -> Compute read (tile IDs)
     b_after[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     b_after[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     b_after[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     b_after[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b_after[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b_after[1].buffer = m_buf_diff_list.buffer;
+    b_after[1].buffer = m_buf_diff_list[slot].buffer;
     b_after[1].offset = 0;
     b_after[1].size = VK_WHOLE_SIZE;
 
-    vkCmdPipelineBarrier(m_cmd_buffer,
+    vkCmdPipelineBarrier(m_cmd_buffer[slot],
                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 0, nullptr, 2, b_after, 0, nullptr);
@@ -1191,11 +1254,11 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         static_cast<uint32_t>(tile_size),
         0u
     };
-    vkCmdBindPipeline(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline);
-    vkCmdBindDescriptorSets(m_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline_layout, 0, 1, &m_comp_desc_set[buf_idx], 0, nullptr);
-    vkCmdPushConstants(m_cmd_buffer, m_comp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(comp_pc), &comp_pc);
+    vkCmdBindPipeline(m_cmd_buffer[slot], VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline);
+    vkCmdBindDescriptorSets(m_cmd_buffer[slot], VK_PIPELINE_BIND_POINT_COMPUTE, m_comp_pipeline_layout, 0, 1, &m_comp_desc_set[slot], 0, nullptr);
+    vkCmdPushConstants(m_cmd_buffer[slot], m_comp_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(comp_pc), &comp_pc);
 
-    vkCmdDispatchIndirect(m_cmd_buffer, m_buf_indirect.buffer, 0);
+    vkCmdDispatchIndirect(m_cmd_buffer[slot], m_buf_indirect[slot].buffer, 0);
 
     // 6. Barrier: Shader write -> Host read
     VkMemoryBarrier mb_host = {
@@ -1203,47 +1266,56 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
         VK_ACCESS_SHADER_WRITE_BIT,
         VK_ACCESS_HOST_READ_BIT
     };
-    vkCmdPipelineBarrier(m_cmd_buffer,
+    vkCmdPipelineBarrier(m_cmd_buffer[slot],
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT,
                          0, 1, &mb_host, 0, nullptr, 0, nullptr);
 
-    if (vkEndCommandBuffer(m_cmd_buffer) != VK_SUCCESS) return nullptr;
+    if (vkEndCommandBuffer(m_cmd_buffer[slot]) != VK_SUCCESS) return nullptr;
 
-    // Single queue submit & single fence wait for the entire frame!
-    vkResetFences(m_device, 1, &m_fence);
     VkSubmitInfo submitInfo = {
         VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
         0, nullptr, nullptr,
-        1, &m_cmd_buffer,
+        1, &m_cmd_buffer[slot],
         0, nullptr
     };
-    if (vkQueueSubmit(m_compute_queue, 1, &submitInfo, m_fence) != VK_SUCCESS) return nullptr;
-    if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return nullptr;
+    if (vkQueueSubmit(m_compute_queue, 1, &submitInfo, m_fence[slot]) != VK_SUCCESS) return nullptr;
+
+    if (pipelined) {
+        m_in_flight = true;
+        m_in_flight_slot = slot;
+        m_in_flight_frame_index = frame_index;
+        m_in_flight_width = width;
+        m_in_flight_height = height;
+        return ret_packet;
+    }
+
+    // Synchronous mode (pipelined == false): wait immediately for THIS slot
+    if (vkWaitForFences(m_device, 1, &m_fence[slot], VK_TRUE, UINT64_MAX) != VK_SUCCESS) return nullptr;
 
     // Invalidate mapped memory to guarantee CPU cache coherency
     VkMappedMemoryRange ranges[3] = {};
     ranges[0].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    ranges[0].memory = m_buf_diff_list.memory;
+    ranges[0].memory = m_buf_diff_list[slot].memory;
     ranges[0].offset = 0;
     ranges[0].size = VK_WHOLE_SIZE;
     ranges[1].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    ranges[1].memory = m_buf_packet_meta.memory;
+    ranges[1].memory = m_buf_packet_meta[slot].memory;
     ranges[1].offset = 0;
     ranges[1].size = VK_WHOLE_SIZE;
     ranges[2].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    ranges[2].memory = m_buf_packet_out.memory;
+    ranges[2].memory = m_buf_packet_out[slot].memory;
     ranges[2].offset = 0;
     ranges[2].size = VK_WHOLE_SIZE;
     vkInvalidateMappedMemoryRanges(m_device, 3, ranges);
 
-    uint32_t dirty_count = *reinterpret_cast<volatile uint32_t*>(m_buf_diff_list.mapped);
+    uint32_t dirty_count = *reinterpret_cast<volatile uint32_t*>(m_buf_diff_list[slot].mapped);
     if (dirty_count == 0) {
         out_total_packet_bytes = 0;
         return nullptr;
     }
 
-    out_total_packet_bytes = *reinterpret_cast<volatile uint32_t*>(m_buf_packet_meta.mapped);
+    out_total_packet_bytes = *reinterpret_cast<volatile uint32_t*>(m_buf_packet_meta[slot].mapped);
 
     // Write 16-byte FrameSectionHeader at start of packet buffer
     protocol::FrameSectionHeader frame_hdr = {};
@@ -1255,16 +1327,72 @@ const uint8_t* VulkanConverter::EncodeFramePacketsGpu(
     frame_hdr.head_id       = 0;
     frame_hdr.reserved      = 0;
 
-    std::memcpy(m_buf_packet_out.mapped, &frame_hdr, sizeof(frame_hdr));
+    std::memcpy(m_buf_packet_out[slot].mapped, &frame_hdr, sizeof(frame_hdr));
 
     VkMappedMemoryRange flush_range = {};
     flush_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    flush_range.memory = m_buf_packet_out.memory;
+    flush_range.memory = m_buf_packet_out[slot].memory;
     flush_range.offset = 0;
     flush_range.size = sizeof(frame_hdr);
     vkFlushMappedMemoryRanges(m_device, 1, &flush_range);
 
-    return static_cast<const uint8_t*>(m_buf_packet_out.mapped);
+    return static_cast<const uint8_t*>(m_buf_packet_out[slot].mapped);
+}
+
+const uint8_t* VulkanConverter::FlushFramePacketsGpu(uint32_t& out_total_packet_bytes) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    out_total_packet_bytes = 0;
+    if (!m_initialized || !m_in_flight) return nullptr;
+
+    int comp_slot = m_in_flight_slot;
+    if (vkWaitForFences(m_device, 1, &m_fence[comp_slot], VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        m_in_flight = false;
+        return nullptr;
+    }
+
+    VkMappedMemoryRange ranges[3] = {};
+    ranges[0].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    ranges[0].memory = m_buf_diff_list[comp_slot].memory;
+    ranges[0].offset = 0;
+    ranges[0].size = VK_WHOLE_SIZE;
+    ranges[1].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    ranges[1].memory = m_buf_packet_meta[comp_slot].memory;
+    ranges[1].offset = 0;
+    ranges[1].size = VK_WHOLE_SIZE;
+    ranges[2].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    ranges[2].memory = m_buf_packet_out[comp_slot].memory;
+    ranges[2].offset = 0;
+    ranges[2].size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(m_device, 3, ranges);
+
+    uint32_t comp_dirty_count = *reinterpret_cast<volatile uint32_t*>(m_buf_diff_list[comp_slot].mapped);
+    uint32_t comp_packet_bytes = *reinterpret_cast<volatile uint32_t*>(m_buf_packet_meta[comp_slot].mapped);
+
+    const uint8_t* ret_packet = nullptr;
+    if (comp_dirty_count > 0 && comp_packet_bytes > sizeof(protocol::FrameSectionHeader)) {
+        protocol::FrameSectionHeader frame_hdr = {};
+        frame_hdr.magic         = protocol::DL_FRAME_MAGIC;
+        frame_hdr.frame_index   = m_in_flight_frame_index;
+        frame_hdr.screen_width  = static_cast<uint16_t>(m_in_flight_width);
+        frame_hdr.screen_height = static_cast<uint16_t>(m_in_flight_height);
+        frame_hdr.tile_count    = static_cast<uint16_t>(comp_dirty_count);
+        frame_hdr.head_id       = 0;
+        frame_hdr.reserved      = 0;
+
+        std::memcpy(m_buf_packet_out[comp_slot].mapped, &frame_hdr, sizeof(frame_hdr));
+
+        VkMappedMemoryRange flush_range = {};
+        flush_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        flush_range.memory = m_buf_packet_out[comp_slot].memory;
+        flush_range.offset = 0;
+        flush_range.size = sizeof(frame_hdr);
+        vkFlushMappedMemoryRanges(m_device, 1, &flush_range);
+
+        ret_packet = static_cast<const uint8_t*>(m_buf_packet_out[comp_slot].mapped);
+        out_total_packet_bytes = comp_packet_bytes;
+    }
+    m_in_flight = false;
+    return ret_packet;
 }
 
 } // namespace dl_turbo
