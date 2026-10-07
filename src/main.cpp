@@ -192,6 +192,59 @@ void RunBenchmark() {
         LOG_INFO("    Asynchronous Multi-URB Dispatch Latency:   %.2f µs (%.4f ms)", async_key_us, async_key_us / 1000.0);
         LOG_INFO("    Thread Stall Elimination:                  %.1fx speedup (Pipelined DMA streaming)", (sync_key_ms * 1000.0) / async_key_us);
         LOG_INFO("  Ring Queue Architecture: %zu Active Asynchronous URBs (Zero Idle Bubbles)", dl_turbo::UsbTransport::NUM_ASYNC_URBS);
+
+        // 7. Dual-4K (Dual Head 2x 3840x2160 @ 60Hz) Workload Evaluation
+        LOG_INFO("[Dual-4K Multi-Monitor Pipeline Evaluation (2x 3840x2160)]");
+        const int DUAL_PASSES = 25;
+        // In dual-4K, each display head is 3840x2160 (8,160 tiles each = 16,320 tiles total, 66.36 MB raw)
+        std::vector<uint8_t> screen0_fb(WIDTH * HEIGHT * 4, 0x33);
+        std::vector<uint8_t> screen1_fb(WIDTH * HEIGHT * 4, 0x77);
+
+        // Benchmark Dual-4K Incremental Updates (100 dirty tiles on Screen 0 + 100 dirty tiles on Screen 1)
+        auto start_dual_inc = std::chrono::high_resolution_clock::now();
+        uint32_t dual_bytes0 = 0, dual_bytes1 = 0;
+        for (int p = 0; p < DUAL_PASSES; ++p) {
+            for (int t = 0; t < 100; ++t) {
+                int px = (t % 10) * 32;
+                int py = (t / 10) * 32;
+                screen0_fb[(py * WIDTH + px) * 4] ^= static_cast<uint8_t>(p + 1);
+                screen1_fb[(py * WIDTH + px) * 4] ^= static_cast<uint8_t>(p + 1);
+            }
+            // Screen 0 (Head 0)
+            vk.EncodeFramePacketsGpu(screen0_fb.data(), WIDTH * 4, WIDTH, HEIGHT, 32, p * 2 + 1, dual_bytes0, dirty_rects, true);
+            // Screen 1 (Head 1)
+            vk.EncodeFramePacketsGpu(screen1_fb.data(), WIDTH * 4, WIDTH, HEIGHT, 32, p * 2 + 2, dual_bytes1, dirty_rects, true);
+        }
+        uint32_t dual_flush_bytes = 0;
+        vk.FlushFramePacketsGpu(dual_flush_bytes);
+        auto end_dual_inc = std::chrono::high_resolution_clock::now();
+        double dual_inc_ms = std::chrono::duration<double, std::milli>(end_dual_inc - start_dual_inc).count();
+
+        double dual_inc_fps = (DUAL_PASSES * 1000.0) / dual_inc_ms;
+        double dual_inc_frame_ms = dual_inc_ms / DUAL_PASSES;
+        LOG_INFO("  Dual-4K Incremental Updates (200 Dirty Tiles Total across 2 Displays):");
+        LOG_INFO("    Throughput: %.2f Dual-Frame Updates/sec (%.2f ms per dual-screen sync)", dual_inc_fps, dual_inc_frame_ms);
+        LOG_INFO("    Effective Per-Display Headroom: %.2f FPS per screen (Target: 60 FPS / 16.6 ms)", dual_inc_fps);
+
+        // Benchmark Dual-4K Full Keyframe Burst (16,320 Tiles = 66.36 MB Raw Framebuffer)
+        const int DUAL_KEY_PASSES = 5;
+        auto start_dual_key = std::chrono::high_resolution_clock::now();
+        for (int k = 0; k < DUAL_KEY_PASSES; ++k) {
+            std::fill(screen0_fb.begin(), screen0_fb.end(), static_cast<uint8_t>(0xA0 + k));
+            std::fill(screen1_fb.begin(), screen1_fb.end(), static_cast<uint8_t>(0xB0 + k));
+            vk.EncodeFramePacketsGpu(screen0_fb.data(), WIDTH * 4, WIDTH, HEIGHT, 32, k * 2 + 500, dual_bytes0, {}, false);
+            vk.EncodeFramePacketsGpu(screen1_fb.data(), WIDTH * 4, WIDTH, HEIGHT, 32, k * 2 + 501, dual_bytes1, {}, false);
+        }
+        auto end_dual_key = std::chrono::high_resolution_clock::now();
+        double dual_key_ms = std::chrono::duration<double, std::milli>(end_dual_key - start_dual_key).count();
+        double dual_key_fps = (DUAL_KEY_PASSES * 1000.0) / dual_key_ms;
+        double dual_key_frame_ms = dual_key_ms / DUAL_KEY_PASSES;
+
+        LOG_INFO("  Dual-4K Full Keyframe Refresh (16,320 Tiles / 66.36 MB Raw):");
+        LOG_INFO("    Throughput: %.2f Dual-Keyframe Refreshes/sec (%.2f ms total)", dual_key_fps, dual_key_frame_ms);
+        LOG_INFO("    Combined Wire Payload: ~%.2f MB across both heads (Wire transmission time: %.2f ms @ USB 3.0)",
+                 (dual_bytes0 + dual_bytes1) / (1024.0 * 1024.0),
+                 ((dual_bytes0 + dual_bytes1) / (420.0 * 1024.0 * 1024.0)) * 1000.0);
     }
 
     // Verify sample output values
