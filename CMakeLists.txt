@@ -38,8 +38,16 @@ if(GLSLC_COMPILER)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420.comp
         COMMENT "Compiling Compute Shader rgb_to_yuv420.comp with glslc"
     )
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/tile_differencing_spv.inc
+        COMMAND ${GLSLC_COMPILER} -mfmt=c ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/tile_differencing.comp -o ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/tile_differencing_spv.inc
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/tile_differencing.comp
+        COMMENT "Compiling Compute Shader tile_differencing.comp with glslc"
+    )
     add_custom_target(compile_shaders ALL
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420_spv.inc
+        DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rgb_to_yuv420_spv.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/tile_differencing_spv.inc
     )
 endif()
 

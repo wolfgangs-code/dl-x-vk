@@ -71,6 +71,18 @@ void RunBenchmark() {
         LOG_INFO("[Vulkan GPU Compute Kernel (Zero-Copy Mapped)]");
         LOG_INFO("  Processed %d 4K frames in %.2f ms", FRAMES, kernel_ms);
         LOG_INFO("  Peak GPU Compute: %.2f FPS (%.2f ms/frame)", (FRAMES * 1000.0) / kernel_ms, kernel_ms / FRAMES);
+
+        // 3. GPU Temporal Macro-Tile Differencing Benchmark
+        auto start_diff = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < FRAMES; ++i) {
+            vk.DispatchTileDifferencing(WIDTH, HEIGHT, WIDTH, 32, true);
+        }
+        auto end_diff = std::chrono::high_resolution_clock::now();
+        double diff_ms = std::chrono::duration<double, std::milli>(end_diff - start_diff).count();
+
+        LOG_INFO("[Vulkan GPU Temporal Tile Differencing (8,160 4K Tiles)]");
+        LOG_INFO("  Processed %d 4K diff passes in %.2f ms", FRAMES, diff_ms);
+        LOG_INFO("  Diff Throughput: %.2f Passes/sec (%.2f ms/pass)", (FRAMES * 1000.0) / diff_ms, diff_ms / FRAMES);
     }
 
     // Verify sample output values

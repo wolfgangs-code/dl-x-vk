@@ -1,4 +1,5 @@
 #include "tile_engine.hpp"
+#include "vulkan_converter.hpp"
 #include <algorithm>
 #include <cstring>
 #include <immintrin.h>
@@ -121,6 +122,15 @@ std::vector<TileCoordinate> TileEngine::FilterChangedTiles(
     int fb_stride,
     const std::vector<TileCoordinate>& candidate_tiles
 ) {
+    if (VulkanConverter::Instance().IsAvailable()) {
+        std::vector<TileCoordinate> gpu_changed;
+        if (VulkanConverter::Instance().FilterDirtyTilesGpu(
+                master_fb, fb_stride, m_screen_width, m_screen_height,
+                m_tile_size, candidate_tiles, gpu_changed)) {
+            return gpu_changed;
+        }
+    }
+
     std::vector<TileCoordinate> changed;
     changed.reserve(candidate_tiles.size());
 

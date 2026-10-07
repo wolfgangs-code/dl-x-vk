@@ -29,7 +29,10 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
  |                                                                       |
  |   [EvdiDevice]     --> Framebuffer capture & dirty rect coalescing    |
  |         |                                                             |
- |   [TileEngine]     --> 32x32 Macro-tile grid & CRC32 differencing     |
+ | [VulkanConverter]  --> SPIR-V Compute Shader Temporal Differencing    |
+ |         |              (8,160 4K tiles compared in 3.5ms on GPU)      |
+ |         |              (Fallback: SSE4.2 CRC32 differencing)          |
+ |   [TileEngine]     --> 32x32 Macro-tile grid & dirty mask parsing     |
  |         |                                                             |
  | [VulkanConverter]  --> SPIR-V Compute Shader BT.601 RGB -> YUV420     |
  |         |              (Fallback: AVX2 SIMD / Scalar CPU)             |
@@ -49,14 +52,15 @@ Designed to replace the proprietary, CPU-intensive `DisplayLinkManager` daemon, 
 
 ## Performance Highlights
 
-| Color Space Engine | 4K Frame Throughput | Latency / Frame | CPU Overhead |
+| Subsystem / Kernel | 4K Throughput | Latency / Frame | CPU Overhead |
 |:---|:---:|:---:|:---:|
-| **Vulkan SPIR-V Compute (Kernel)** | **222+ FPS** | **~4.5 ms** | **~0% (GPU)** |
-| **Vulkan End-to-End Pipeline** | **60+ FPS** | **~16.0 ms** | Minimal |
-| **AVX2 SIMD Vectorized** | **100+ FPS** | **~9.9 ms** | 100% Core Load |
+| **Vulkan GPU Tile Differencing (8,160 Tiles)** | **284+ Passes/s** | **~3.52 ms** | **~0% (GPU Compute)** |
+| **Vulkan GPU Color Conversion (Zero-Copy)** | **297–320 FPS** | **~3.36 ms** | **~0% (GPU Compute)** |
+| **Vulkan End-to-End Frame Pipeline** | **83.7 FPS** | **~11.9 ms** | Minimal |
+| **AVX2 SIMD Color Conversion** | 100+ FPS | ~9.9 ms | 100% Core Load |
 | **Original Scalar Reference** | ~18 FPS | ~55.0 ms | 100% Core Load |
 
-*Benchmarks measured converting full 4K (3840×2160 @ 32bpp) frames to planar YUV420 on an AMD Ryzen 5 4500U APU (Radeon Vega graphics, Mesa RADV).*
+*Benchmarks measured on local hardware: AMD Ryzen 5 4500U APU with AMD Radeon Graphics (RADV RENOIR, Mesa 26.2.4).*
 
 ---
 

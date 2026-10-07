@@ -1,0 +1,86 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 4) in; // 128 threads per workgroup
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint stride_words;
+    uint grid_cols;
+    uint grid_rows;
+    uint tile_size;
+    uint update_ref;
+} pc;
+
+layout(std430, binding = 0) readonly buffer CurrentFrame {
+    uint curr_pixels[];
+};
+
+layout(std430, binding = 1) buffer ReferenceFrame {
+    uint prev_pixels[];
+};
+
+layout(std430, binding = 2) writeonly buffer DirtyBitmask {
+    uint dirty_mask[];
+};
+
+layout(std430, binding = 3) buffer DirtyList {
+    uint dirty_count;
+    uint dirty_tile_ids[];
+};
+
+shared uint s_dirty;
+
+void main() {
+    uint tile_x = gl_WorkGroupID.x;
+    uint tile_y = gl_WorkGroupID.y;
+
+    if (tile_x >= pc.grid_cols || tile_y >= pc.grid_rows) return;
+
+    if (gl_LocalInvocationIndex == 0) {
+        s_dirty = 0;
+    }
+    barrier();
+
+    uint lx = gl_LocalInvocationID.x; // 0..31 across tile row
+    uint ly = gl_LocalInvocationID.y; // 0..3 row group
+
+    uint tile_origin_x = tile_x * pc.tile_size;
+    uint tile_origin_y = tile_y * pc.tile_size;
+
+    uint gx = tile_origin_x + lx;
+    bool mismatch = false;
+
+    // 128 threads test 32 rows of 32 pixels (8 rows per thread, stride of 4)
+    for (uint r = 0; r < 8; ++r) {
+        uint row = ly + r * 4;
+        uint gy = tile_origin_y + row;
+
+        if (gx < pc.width && gy < pc.height) {
+            uint offset = gy * pc.stride_words + gx;
+            uint c = curr_pixels[offset];
+            uint p = prev_pixels[offset];
+
+            if (c != p) {
+                mismatch = true;
+                if (pc.update_ref != 0u) {
+                    prev_pixels[offset] = c;
+                }
+            }
+        }
+    }
+
+    if (mismatch) {
+        atomicOr(s_dirty, 1u);
+    }
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0) {
+        uint tile_id = tile_y * pc.grid_cols + tile_x;
+        if (s_dirty != 0u) {
+            atomicOr(dirty_mask[tile_id / 32u], 1u << (tile_id % 32u));
+            uint slot = atomicAdd(dirty_count, 1u);
+            dirty_tile_ids[slot] = tile_id;
+        }
+    }
+}
