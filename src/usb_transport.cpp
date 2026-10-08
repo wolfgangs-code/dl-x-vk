@@ -113,11 +113,18 @@ bool UsbTransport::OpenDevice(uint16_t vendor_id, uint16_t product_id) {
 
     // Claim Video Control Interface (0)
     rc = libusb_claim_interface(m_handle, protocol::INTERFACE_VIDEO_CONTROL);
-    if (rc != 0) {
-        LOG_WARN("Could not claim interface 0 (busy or owned by existing driver): %s", libusb_error_name(rc));
-    } else {
-        LOG_INFO("Claimed DisplayLink Control Interface 0");
+    if (rc == LIBUSB_ERROR_BUSY) {
+        LOG_WARN("Interface 0 is busy; attempting to detach kernel driver...");
+        libusb_detach_kernel_driver(m_handle, protocol::INTERFACE_VIDEO_CONTROL);
+        rc = libusb_claim_interface(m_handle, protocol::INTERFACE_VIDEO_CONTROL);
     }
+    if (rc != 0) {
+        LOG_ERROR("Could not claim interface 0 (busy or owned by existing driver): %s", libusb_error_name(rc));
+        libusb_close(m_handle);
+        m_handle = nullptr;
+        return false;
+    }
+    LOG_INFO("Claimed DisplayLink Control Interface 0");
 
     // Initialize Asynchronous Multi-URB Ring Queue
     {

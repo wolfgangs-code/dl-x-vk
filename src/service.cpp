@@ -39,9 +39,19 @@ bool DisplayLinkService::Start() {
                  d.product_name.c_str(), d.serial_number.c_str());
     }
 
+    bool usb_opened = false;
     if (!devices.empty()) {
-        if (!m_usb->OpenDevice(devices[0].vendor_id, devices[0].product_id)) {
-            LOG_WARN("Could not open hardware USB device; proceeding in EVDI emulation mode");
+        for (int retry = 0; retry < 5; ++retry) {
+            if (m_usb->OpenDevice(devices[0].vendor_id, devices[0].product_id)) {
+                usb_opened = true;
+                break;
+            }
+            LOG_WARN("USB device busy, retrying in 500ms... (%d/5)", retry + 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (!usb_opened) {
+            LOG_ERROR("Failed to acquire DisplayLink USB device after retries!");
+            return false;
         }
     } else {
         LOG_WARN("No DisplayLink dock connected; operating in virtual EVDI pipeline mode");

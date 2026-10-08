@@ -193,34 +193,44 @@ def main():
 
     vanilla_results = sample_metrics(vanilla_pid, "Vanilla DisplayLinkManager", duration_sec=15)
 
-    # Stop vanilla service
-    print("\n[*] Stopping vanilla displaylink.service...")
+    # Stop and mask vanilla service so udev rule cannot resurrect it on replug
+    print("\n[*] Stopping and masking vanilla displaylink.service...")
     subprocess.run(["systemctl", "stop", "displaylink.service"], stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "mask", "displaylink.service"], stderr=subprocess.DEVNULL)
+    subprocess.run(["killall", "-9", "DisplayLinkManager"], stderr=subprocess.DEVNULL)
     time.sleep(1.0)
 
-    # ---------------------------------------------------------
-    # PHASE 2: DisplayLink Turbo (dl-x-vk)
-    # ---------------------------------------------------------
-    print("\n[PHASE 2] Preparing DisplayLink Turbo (dl-x-vk)...")
-    wait_for_user_replug("Reconnecting dock to reset ASIC firmware for DisplayLink Turbo...")
+    try:
+        # ---------------------------------------------------------
+        # PHASE 2: DisplayLink Turbo (dl-x-vk)
+        # ---------------------------------------------------------
+        print("\n[PHASE 2] Preparing DisplayLink Turbo (dl-x-vk)...")
+        wait_for_user_replug("Reconnecting dock to reset ASIC firmware for DisplayLink Turbo...")
 
-    print("[*] Starting DisplayLink Turbo via systemd-run...")
-    subprocess.run([
-        "systemd-run", "--unit=displaylink-turbo",
-        turbo_bin, "-logging"
-    ], check=True)
-    time.sleep(3.0)
+        # Guarantee interface 0 is completely free
+        subprocess.run(["killall", "-9", "DisplayLinkManager"], stderr=subprocess.DEVNULL)
+        time.sleep(1.0)
 
-    turbo_pid = find_pid("dl-x-vk")
-    if not turbo_pid:
-        print("[!] Error: DisplayLink Turbo (dl-x-vk) failed to start.")
-        sys.exit(1)
-    print(f"[*] DisplayLink Turbo running with PID {turbo_pid}.")
+        print("[*] Starting DisplayLink Turbo via systemd-run...")
+        subprocess.run([
+            "systemd-run", "--unit=displaylink-turbo",
+            turbo_bin, "-logging"
+        ], check=True)
+        time.sleep(3.0)
 
-    print("[*] Allowing desktop environment 5 seconds to stabilize modes...")
-    time.sleep(5.0)
+        turbo_pid = find_pid("dl-x-vk")
+        if not turbo_pid:
+            print("[!] Error: DisplayLink Turbo (dl-x-vk) failed to start.")
+            sys.exit(1)
+        print(f"[*] DisplayLink Turbo running with PID {turbo_pid}.")
 
-    turbo_results = sample_metrics(turbo_pid, "DisplayLink Turbo (dl-x-vk)", duration_sec=15)
+        print("[*] Allowing desktop environment 5 seconds to stabilize modes...")
+        time.sleep(5.0)
+
+        turbo_results = sample_metrics(turbo_pid, "DisplayLink Turbo (dl-x-vk)", duration_sec=15)
+    finally:
+        # Always restore unmasked state for vanilla service
+        subprocess.run(["systemctl", "unmask", "displaylink.service"], stderr=subprocess.DEVNULL)
 
     # ---------------------------------------------------------
     # SUMMARY REPORT
