@@ -100,5 +100,44 @@ add_custom_command(TARGET dl-x-vk POST_BUILD
     $<TARGET_FILE_DIR:dl-x-vk>/displaylink-turbo
 )
 
+# Build Vulkan EVDI Turbo Shim
+set(SHIM_SOURCES
+    src/shim/evdi_shim.cpp
+    src/vulkan_converter.cpp
+    src/tile_engine.cpp
+)
+
+add_library(evdi_turbo SHARED ${SHIM_SOURCES})
+if(GLSLC_COMPILER)
+    add_dependencies(evdi_turbo compile_shaders)
+endif()
+
+target_include_directories(evdi_turbo PRIVATE
+    src
+    include
+    ${EVDI_INCLUDE_DIR}
+)
+
+target_link_libraries(evdi_turbo PRIVATE
+    ${VULKAN_LIBRARY}
+    dl
+    pthread
+)
+
+set_target_properties(evdi_turbo PROPERTIES
+    OUTPUT_NAME "evdi_turbo"
+    PREFIX "lib"
+)
+
+add_custom_command(TARGET evdi_turbo POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+    $<TARGET_FILE_NAME:evdi_turbo>
+    $<TARGET_FILE_DIR:evdi_turbo>/libevdi.so.1
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+    $<TARGET_FILE_NAME:evdi_turbo>
+    $<TARGET_FILE_DIR:evdi_turbo>/libevdi.so
+)
+
+
 # Installation target
 install(TARGETS dl-x-vk RUNTIME DESTINATION bin)
