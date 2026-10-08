@@ -72,6 +72,34 @@ void VulkanConverter::DestroyBuffer(VulkanBuffer& buf) {
     buf.size = 0;
 }
 
+void VulkanConverter::UpdateImportedDescriptorSet(int head_id, ImportedBuffer& imp, size_t fb_size, size_t mask_size, size_t list_size) {
+    if (imp.desc_set == VK_NULL_HANDLE || imp.buffer == VK_NULL_HANDLE) return;
+    auto& head = m_heads[head_id];
+    if (head.buf_diff_ref.buffer == VK_NULL_HANDLE ||
+        head.buf_diff_mask[0].buffer == VK_NULL_HANDLE ||
+        head.buf_diff_list[0].buffer == VK_NULL_HANDLE) return;
+
+    VkDescriptorBufferInfo dbi[4] = {
+        { imp.buffer, imp.page_offset, imp.fb_size },
+        { head.buf_diff_ref.buffer, 0, fb_size },
+        { head.buf_diff_mask[0].buffer, 0, mask_size },
+        { head.buf_diff_list[0].buffer, 0, list_size }
+    };
+
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = imp.desc_set;
+        writes[i].dstBinding = i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].descriptorCount = 1;
+        writes[i].pBufferInfo = &dbi[i];
+    }
+    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+    imp.desc_set_valid = true;
+}
+
 bool VulkanConverter::EnsureDiffBuffers(int head_id, size_t fb_size, uint32_t total_tiles) {
     if (head_id < 0 || head_id >= MAX_HEADS) head_id = 0;
     auto& head = m_heads[head_id];
@@ -80,7 +108,9 @@ bool VulkanConverter::EnsureDiffBuffers(int head_id, size_t fb_size, uint32_t to
     size_t mask_size = std::max(size_t(256), static_cast<size_t>(mask_words) * sizeof(uint32_t));
     size_t list_size = std::max(size_t(256), (1 + static_cast<size_t>(total_tiles)) * sizeof(uint32_t));
 
-    // Input double-buffers
+    bool buffers_changed = false;
+
+    // Fallback input double-buffers (used if host memory import is unavailable)
     for (int b = 0; b < 2; b++) {
         if (head.buf_input[b].size < fb_size) {
             DestroyBuffer(head.buf_input[b]);
@@ -97,6 +127,7 @@ bool VulkanConverter::EnsureDiffBuffers(int head_id, size_t fb_size, uint32_t to
             vkBindBufferMemory(m_device, head.buf_input[b].buffer, head.buf_input[b].memory, 0);
             vkMapMemory(m_device, head.buf_input[b].memory, 0, fb_size, 0, &head.buf_input[b].mapped);
             head.buf_input[b].size = fb_size;
+            buffers_changed = true;
         }
     }
 
@@ -114,6 +145,7 @@ bool VulkanConverter::EnsureDiffBuffers(int head_id, size_t fb_size, uint32_t to
         if (vkAllocateMemory(m_device, &ai, nullptr, &head.buf_diff_ref.memory) != VK_SUCCESS) return false;
         vkBindBufferMemory(m_device, head.buf_diff_ref.buffer, head.buf_diff_ref.memory, 0);
         head.buf_diff_ref.size = fb_size;
+        buffers_changed = true;
     }
 
     // Bitmask & dirty list buffers (double-buffered)
@@ -133,6 +165,7 @@ bool VulkanConverter::EnsureDiffBuffers(int head_id, size_t fb_size, uint32_t to
             vkBindBufferMemory(m_device, head.buf_diff_mask[b].buffer, head.buf_diff_mask[b].memory, 0);
             vkMapMemory(m_device, head.buf_diff_mask[b].memory, 0, mask_size, 0, &head.buf_diff_mask[b].mapped);
             head.buf_diff_mask[b].size = mask_size;
+            buffers_changed = true;
         }
 
         if (head.buf_diff_list[b].size < list_size) {
@@ -150,12 +183,13 @@ bool VulkanConverter::EnsureDiffBuffers(int head_id, size_t fb_size, uint32_t to
             vkBindBufferMemory(m_device, head.buf_diff_list[b].buffer, head.buf_diff_list[b].memory, 0);
             vkMapMemory(m_device, head.buf_diff_list[b].memory, 0, list_size, 0, &head.buf_diff_list[b].mapped);
             head.buf_diff_list[b].size = list_size;
+            buffers_changed = true;
         }
     }
 
     head.diff_total_tiles = total_tiles;
 
-    // Update descriptor sets for both double-buffered slots
+    // Update fallback descriptor sets
     for (int b = 0; b < 2; b++) {
         VkDescriptorBufferInfo dbi[4] = {
             { head.buf_input[b].buffer,     0, fb_size },
@@ -177,6 +211,13 @@ bool VulkanConverter::EnsureDiffBuffers(int head_id, size_t fb_size, uint32_t to
         vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
     }
 
+    // If underlying GPU diff buffers changed or were created, update all registered imported buffers
+    if (buffers_changed) {
+        for (auto& imp : head.imported_buffers) {
+            UpdateImportedDescriptorSet(head_id, imp, fb_size, mask_size, list_size);
+        }
+    }
+
     return true;
 }
 
@@ -184,7 +225,21 @@ bool VulkanConverter::Initialize() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_initialized) return true;
 
-    // 1. Instance
+    // 1. Instance Extensions
+    std::vector<const char*> instExts;
+    uint32_t instExtCount = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, nullptr);
+    if (instExtCount > 0) {
+        std::vector<VkExtensionProperties> instExtProps(instExtCount);
+        vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, instExtProps.data());
+        for (const auto& ext : instExtProps) {
+            if (strcmp(ext.extensionName, "VK_KHR_external_memory_capabilities") == 0) {
+                instExts.push_back("VK_KHR_external_memory_capabilities");
+                break;
+            }
+        }
+    }
+
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "libevdi_turbo";
@@ -196,6 +251,8 @@ bool VulkanConverter::Initialize() {
     VkInstanceCreateInfo instInfo = {};
     instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instInfo.pApplicationInfo = &appInfo;
+    instInfo.enabledExtensionCount = static_cast<uint32_t>(instExts.size());
+    instInfo.ppEnabledExtensionNames = instExts.empty() ? nullptr : instExts.data();
 
     if (vkCreateInstance(&instInfo, nullptr, &m_instance) != VK_SUCCESS) {
         LOG_WARN("Could not initialize Vulkan instance");
@@ -245,7 +302,24 @@ bool VulkanConverter::Initialize() {
              VK_VERSION_MINOR(props.driverVersion),
              VK_VERSION_PATCH(props.driverVersion));
 
-    // 3. Logical Device
+    // 3. Check for VK_EXT_external_memory_host device extension
+    std::vector<const char*> devExts;
+    uint32_t devExtCount = 0;
+    vkEnumerateDeviceExtensionProperties(m_physical_device, nullptr, &devExtCount, nullptr);
+    bool supports_ext_mem_host = false;
+    if (devExtCount > 0) {
+        std::vector<VkExtensionProperties> devExtProps(devExtCount);
+        vkEnumerateDeviceExtensionProperties(m_physical_device, nullptr, &devExtCount, devExtProps.data());
+        for (const auto& ext : devExtProps) {
+            if (strcmp(ext.extensionName, "VK_EXT_external_memory_host") == 0) {
+                devExts.push_back("VK_EXT_external_memory_host");
+                supports_ext_mem_host = true;
+                break;
+            }
+        }
+    }
+
+    // 4. Logical Device
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueCreateInfo = {};
     queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -263,6 +337,8 @@ bool VulkanConverter::Initialize() {
     deviceCreateInfo.pNext = &features12;
     deviceCreateInfo.queueCreateInfoCount = 1;
     deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
+    deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(devExts.size());
+    deviceCreateInfo.ppEnabledExtensionNames = devExts.empty() ? nullptr : devExts.data();
 
     if (vkCreateDevice(m_physical_device, &deviceCreateInfo, nullptr, &m_device) != VK_SUCCESS) {
         LOG_WARN("Failed to create Vulkan logical device");
@@ -272,7 +348,34 @@ bool VulkanConverter::Initialize() {
 
     vkGetDeviceQueue(m_device, m_compute_queue_family, 0, &m_compute_queue);
 
-    // 4. Tile Differencing Pipeline
+    // 5. Initialize VK_EXT_external_memory_host function pointer
+    if (supports_ext_mem_host) {
+        m_vkGetMemoryHostPointerPropertiesEXT = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            vkGetDeviceProcAddr(m_device, "vkGetMemoryHostPointerPropertiesEXT")
+        );
+        if (m_vkGetMemoryHostPointerPropertiesEXT) {
+            m_has_external_memory_host = true;
+
+            VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps = {};
+            hostProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 props2 = {};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props2.pNext = &hostProps;
+            vkGetPhysicalDeviceProperties2(m_physical_device, &props2);
+            if (hostProps.minImportedHostPointerAlignment > 0) {
+                m_min_imported_host_pointer_alignment = hostProps.minImportedHostPointerAlignment;
+            }
+
+            LOG_INFO("Vulkan Zero-Copy host memory import enabled! (minImportedHostPointerAlignment=%zu)",
+                     m_min_imported_host_pointer_alignment);
+        } else {
+            LOG_WARN("Could not load vkGetMemoryHostPointerPropertiesEXT function pointer");
+        }
+    } else {
+        LOG_WARN("VK_EXT_external_memory_host not supported on device; using fallback staging buffer");
+    }
+
+    // 6. Tile Differencing Pipeline
     VkShaderModuleCreateInfo diffModuleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
                                                 sizeof(s_tile_differencing_spv), s_tile_differencing_spv };
     if (vkCreateShaderModule(m_device, &diffModuleInfo, nullptr, &m_diff_shader_module) != VK_SUCCESS) {
@@ -314,11 +417,15 @@ bool VulkanConverter::Initialize() {
         return false;
     }
 
-    // 5. Descriptor Pool & Command Pool
+    // 7. Descriptor Pool (supports dynamic allocation and free for imported buffers)
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 }
     };
-    VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 8, 1, poolSizes };
+    VkDescriptorPoolCreateInfo poolInfo = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr,
+        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        32, 1, poolSizes
+    };
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_desc_pool) != VK_SUCCESS) {
         LOG_ERROR("Failed to create descriptor pool");
         Cleanup();
@@ -333,7 +440,7 @@ bool VulkanConverter::Initialize() {
         return false;
     }
 
-    // 6. Allocate Per-Head Descriptor Sets, Command Buffers, and Fences
+    // 8. Allocate Per-Head Fallback Descriptor Sets, Command Buffers, and Fences
     for (int h = 0; h < MAX_HEADS; h++) {
         VkDescriptorSetLayout layouts[2] = { m_diff_desc_layout, m_diff_desc_layout };
         VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, m_desc_pool, 2, layouts };
@@ -374,6 +481,7 @@ void VulkanConverter::Cleanup() {
         vkDeviceWaitIdle(m_device);
 
         for (int h = 0; h < MAX_HEADS; h++) {
+            UnregisterAllExternalBuffers(h);
             for (int b = 0; b < 2; b++) {
                 DestroyBuffer(m_heads[h].buf_input[b]);
                 DestroyBuffer(m_heads[h].buf_diff_mask[b]);
@@ -420,7 +528,251 @@ void VulkanConverter::Cleanup() {
         m_instance = VK_NULL_HANDLE;
     }
 
+    m_has_external_memory_host = false;
+    m_vkGetMemoryHostPointerPropertiesEXT = nullptr;
     m_initialized = false;
+}
+
+ImportedBuffer* VulkanConverter::FindImportedBuffer(int head_id, const void* host_ptr) {
+    if (head_id < 0 || head_id >= MAX_HEADS) return nullptr;
+    auto& head = m_heads[head_id];
+    for (auto& b : head.imported_buffers) {
+        if (b.host_ptr == host_ptr) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+
+bool VulkanConverter::IsBufferImported(int head_id, const void* host_ptr) const {
+    if (head_id < 0 || head_id >= MAX_HEADS) return false;
+    const auto& head = m_heads[head_id];
+    for (const auto& b : head.imported_buffers) {
+        if (b.host_ptr == host_ptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool VulkanConverter::RegisterExternalBuffer(int head_id, int buffer_id, void* host_ptr, size_t fb_size) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized || !m_has_external_memory_host || !host_ptr || fb_size == 0) {
+        return false;
+    }
+    if (head_id < 0 || head_id >= MAX_HEADS) head_id = 0;
+    auto& head = m_heads[head_id];
+
+    // Check if already registered
+    for (const auto& imp : head.imported_buffers) {
+        if (imp.buffer_id == buffer_id && imp.host_ptr == host_ptr && imp.fb_size == fb_size) {
+            return true;
+        }
+    }
+
+    // If buffer_id exists with a different pointer, unregister it first
+    if (buffer_id >= 0) {
+        UnregisterExternalBuffer(head_id, buffer_id);
+    }
+
+    uintptr_t host_addr = reinterpret_cast<uintptr_t>(host_ptr);
+    size_t align = m_min_imported_host_pointer_alignment;
+    if (align == 0) align = 4096;
+
+    uintptr_t page_addr = host_addr & ~(align - 1);
+    uint32_t page_offset = static_cast<uint32_t>(host_addr - page_addr);
+    size_t alloc_size = (fb_size + page_offset + align - 1) & ~(align - 1);
+
+    // Verify storage buffer offset alignment (typically 4 bytes on AMD APU)
+    if (page_offset % 4 != 0) {
+        LOG_WARN("[Vulkan] Host pointer %p offset %u is not 4-byte aligned", host_ptr, page_offset);
+        return false;
+    }
+
+    VkMemoryHostPointerPropertiesEXT hostProps = {
+        VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT, nullptr, 0
+    };
+    VkResult res = m_vkGetMemoryHostPointerPropertiesEXT(
+        m_device,
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        reinterpret_cast<void*>(page_addr),
+        &hostProps
+    );
+    if (res != VK_SUCCESS) {
+        LOG_WARN("[Vulkan] vkGetMemoryHostPointerPropertiesEXT failed for ptr %p: %d", host_ptr, res);
+        return false;
+    }
+
+    VkExternalMemoryBufferCreateInfo extBufInfo = {
+        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr,
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT
+    };
+
+    VkBufferCreateInfo bci = {
+        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &extBufInfo, 0,
+        alloc_size,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_SHARING_MODE_EXCLUSIVE, 0, nullptr
+    };
+
+    VkBuffer vk_buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(m_device, &bci, nullptr, &vk_buf) != VK_SUCCESS) {
+        LOG_WARN("[Vulkan] Failed to create external buffer for ptr %p", host_ptr);
+        return false;
+    }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(m_device, vk_buf, &req);
+
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(m_physical_device, &memProps);
+    uint32_t memTypeIndex = UINT32_MAX;
+
+    // Prefer HOST_COHERENT | HOST_CACHED
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+        if ((req.memoryTypeBits & hostProps.memoryTypeBits) & (1 << i)) {
+            auto flags = memProps.memoryTypes[i].propertyFlags;
+            if ((flags & (VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+                memTypeIndex = i;
+                break;
+            }
+        }
+    }
+    if (memTypeIndex == UINT32_MAX) {
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+            if ((req.memoryTypeBits & hostProps.memoryTypeBits) & (1 << i)) {
+                if (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
+                    memTypeIndex = i;
+                    break;
+                }
+            }
+        }
+    }
+    if (memTypeIndex == UINT32_MAX) {
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+            if ((req.memoryTypeBits & hostProps.memoryTypeBits) & (1 << i)) {
+                memTypeIndex = i;
+                break;
+            }
+        }
+    }
+
+    if (memTypeIndex == UINT32_MAX) {
+        LOG_WARN("[Vulkan] No suitable memory type found for external host pointer %p", host_ptr);
+        vkDestroyBuffer(m_device, vk_buf, nullptr);
+        return false;
+    }
+
+    VkImportMemoryHostPointerInfoEXT importInfo = {
+        VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr,
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        reinterpret_cast<void*>(page_addr)
+    };
+
+    VkMemoryAllocateInfo ai = {
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &importInfo,
+        req.size, memTypeIndex
+    };
+
+    VkDeviceMemory vk_mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(m_device, &ai, nullptr, &vk_mem) != VK_SUCCESS) {
+        LOG_WARN("[Vulkan] vkAllocateMemory failed for external host pointer %p", host_ptr);
+        vkDestroyBuffer(m_device, vk_buf, nullptr);
+        return false;
+    }
+
+    if (vkBindBufferMemory(m_device, vk_buf, vk_mem, 0) != VK_SUCCESS) {
+        LOG_WARN("[Vulkan] vkBindBufferMemory failed for external buffer %p", host_ptr);
+        vkFreeMemory(m_device, vk_mem, nullptr);
+        vkDestroyBuffer(m_device, vk_buf, nullptr);
+        return false;
+    }
+
+    // Allocate dedicated descriptor set from pool
+    VkDescriptorSetAllocateInfo dsai = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr,
+        m_desc_pool, 1, &m_diff_desc_layout
+    };
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(m_device, &dsai, &desc_set) != VK_SUCCESS) {
+        LOG_WARN("[Vulkan] Failed to allocate descriptor set for imported buffer %p", host_ptr);
+        vkFreeMemory(m_device, vk_mem, nullptr);
+        vkDestroyBuffer(m_device, vk_buf, nullptr);
+        return false;
+    }
+
+    ImportedBuffer imp;
+    imp.buffer_id = buffer_id;
+    imp.host_ptr = host_ptr;
+    imp.page_addr = page_addr;
+    imp.page_offset = page_offset;
+    imp.alloc_size = alloc_size;
+    imp.fb_size = fb_size;
+    imp.buffer = vk_buf;
+    imp.memory = vk_mem;
+    imp.desc_set = desc_set;
+
+    // If GPU differencing buffers already exist, bind descriptor set now
+    if (head.buf_diff_ref.buffer != VK_NULL_HANDLE &&
+        head.buf_diff_mask[0].buffer != VK_NULL_HANDLE &&
+        head.buf_diff_list[0].buffer != VK_NULL_HANDLE) {
+        UpdateImportedDescriptorSet(head_id, imp, head.buf_diff_ref.size,
+                                    head.buf_diff_mask[0].size, head.buf_diff_list[0].size);
+    }
+
+    head.imported_buffers.push_back(imp);
+    LOG_INFO("[Vulkan] Imported host buffer (head=%d, id=%d, ptr=%p, offset=%u, size=%zu) into Vulkan zero-copy memory!",
+             head_id, buffer_id, host_ptr, page_offset, fb_size);
+    return true;
+}
+
+void VulkanConverter::UnregisterExternalBuffer(int head_id, int buffer_id) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (head_id < 0 || head_id >= MAX_HEADS) return;
+    auto& head = m_heads[head_id];
+
+    auto it = std::find_if(head.imported_buffers.begin(), head.imported_buffers.end(),
+        [buffer_id](const ImportedBuffer& b) { return b.buffer_id == buffer_id; });
+
+    if (it != head.imported_buffers.end()) {
+        if (m_device != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(m_device);
+            if (it->desc_set != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(m_device, m_desc_pool, 1, &it->desc_set);
+            }
+            if (it->buffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(m_device, it->buffer, nullptr);
+            }
+            if (it->memory != VK_NULL_HANDLE) {
+                vkFreeMemory(m_device, it->memory, nullptr);
+            }
+        }
+        head.imported_buffers.erase(it);
+        LOG_INFO("[Vulkan] Unregistered external buffer id=%d on head %d", buffer_id, head_id);
+    }
+}
+
+void VulkanConverter::UnregisterAllExternalBuffers(int head_id) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (head_id < 0 || head_id >= MAX_HEADS) return;
+    auto& head = m_heads[head_id];
+
+    if (m_device != VK_NULL_HANDLE && !head.imported_buffers.empty()) {
+        vkDeviceWaitIdle(m_device);
+        for (auto& it : head.imported_buffers) {
+            if (it.desc_set != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(m_device, m_desc_pool, 1, &it.desc_set);
+            }
+            if (it.buffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(m_device, it.buffer, nullptr);
+            }
+            if (it.memory != VK_NULL_HANDLE) {
+                vkFreeMemory(m_device, it.memory, nullptr);
+            }
+        }
+    }
+    head.imported_buffers.clear();
 }
 
 bool VulkanConverter::DispatchTileDifferencing(
@@ -433,7 +785,8 @@ bool VulkanConverter::DispatchTileDifferencing(
     uint32_t start_row,
     uint32_t num_cols,
     uint32_t num_rows,
-    int head_id
+    int head_id,
+    VkDescriptorSet custom_desc_set
 ) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized) return false;
@@ -475,8 +828,10 @@ bool VulkanConverter::DispatchTileDifferencing(
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     vkCmdBindPipeline(head.cmd_buffer[0], VK_PIPELINE_BIND_POINT_COMPUTE, m_diff_pipeline);
+
+    VkDescriptorSet desc_set = (custom_desc_set != VK_NULL_HANDLE) ? custom_desc_set : head.diff_desc_set[0];
     vkCmdBindDescriptorSets(head.cmd_buffer[0], VK_PIPELINE_BIND_POINT_COMPUTE,
-                            m_diff_pipeline_layout, 0, 1, &head.diff_desc_set[0], 0, nullptr);
+                            m_diff_pipeline_layout, 0, 1, &desc_set, 0, nullptr);
     vkCmdPushConstants(head.cmd_buffer[0], m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(DiffPushConstants), &pc);
 
@@ -538,28 +893,58 @@ bool VulkanConverter::DetectDirtyTiles(
     uint32_t num_cols = (end_col > start_col) ? (end_col - start_col) : 1;
     uint32_t num_rows = (end_row > start_row) ? (end_row - start_row) : 1;
 
-    // Sub-region memory copy: only copy the rows within [clip_y1, clip_y2)
-    if (curr_fb && curr_fb != head.buf_input[0].mapped && curr_fb != head.buf_input[1].mapped) {
-        if (clip_x1 == 0 && clip_x2 == width) {
-            size_t copy_offset = static_cast<size_t>(clip_y1) * fb_stride;
-            size_t copy_bytes = static_cast<size_t>(clip_y2 - clip_y1) * fb_stride;
-            std::memcpy(static_cast<uint8_t*>(head.buf_input[0].mapped) + copy_offset,
-                        curr_fb + copy_offset,
-                        copy_bytes);
-        } else {
-            size_t row_bytes = static_cast<size_t>(clip_x2 - clip_x1) * 4;
-            for (int y = clip_y1; y < clip_y2; ++y) {
-                size_t offset = static_cast<size_t>(y) * fb_stride + (clip_x1 * 4);
-                std::memcpy(static_cast<uint8_t*>(head.buf_input[0].mapped) + offset,
-                            curr_fb + offset,
-                            row_bytes);
+    // Check if curr_fb is an imported host memory buffer (Vector 2: Zero-Copy)
+    ImportedBuffer* imp = FindImportedBuffer(head_id, curr_fb);
+    if (!imp && m_has_external_memory_host && curr_fb) {
+        // Try on-demand import if not already registered
+        if (RegisterExternalBuffer(head_id, -1, const_cast<uint8_t*>(curr_fb), fb_size)) {
+            imp = FindImportedBuffer(head_id, curr_fb);
+        }
+    }
+
+    VkDescriptorSet desc_set_to_use = VK_NULL_HANDLE;
+
+    if (imp && imp->desc_set != VK_NULL_HANDLE) {
+        if (!imp->desc_set_valid) {
+            uint32_t mask_words = (total_tiles + 31) / 32;
+            size_t mask_size = std::max(size_t(256), static_cast<size_t>(mask_words) * sizeof(uint32_t));
+            size_t list_size = std::max(size_t(256), (1 + static_cast<size_t>(total_tiles)) * sizeof(uint32_t));
+            UpdateImportedDescriptorSet(head_id, *imp, fb_size, mask_size, list_size);
+        }
+        if (imp->desc_set_valid) {
+            // ZERO-COPY PATH: Host memory mapped directly via VK_EXT_external_memory_host!
+            // No std::memcpy row copy!
+            desc_set_to_use = imp->desc_set;
+            m_zero_copy_dispatches.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    if (desc_set_to_use == VK_NULL_HANDLE) {
+        // FALLBACK PATH: CPU sub-region memory copy into staging buffer
+        if (curr_fb && curr_fb != head.buf_input[0].mapped && curr_fb != head.buf_input[1].mapped) {
+            if (clip_x1 == 0 && clip_x2 == width) {
+                size_t copy_offset = static_cast<size_t>(clip_y1) * fb_stride;
+                size_t copy_bytes = static_cast<size_t>(clip_y2 - clip_y1) * fb_stride;
+                std::memcpy(static_cast<uint8_t*>(head.buf_input[0].mapped) + copy_offset,
+                            curr_fb + copy_offset,
+                            copy_bytes);
+            } else {
+                size_t row_bytes = static_cast<size_t>(clip_x2 - clip_x1) * 4;
+                for (int y = clip_y1; y < clip_y2; ++y) {
+                    size_t offset = static_cast<size_t>(y) * fb_stride + (clip_x1 * 4);
+                    std::memcpy(static_cast<uint8_t*>(head.buf_input[0].mapped) + offset,
+                                curr_fb + offset,
+                                row_bytes);
+                }
             }
         }
+        desc_set_to_use = head.diff_desc_set[0];
+        m_fallback_dispatches.fetch_add(1, std::memory_order_relaxed);
     }
 
     int stride_words = fb_stride / 4;
     if (!DispatchTileDifferencing(width, height, stride_words, tile_size, true,
-                                 start_col, start_row, num_cols, num_rows, head_id)) {
+                                 start_col, start_row, num_cols, num_rows, head_id, desc_set_to_use)) {
         return false;
     }
 

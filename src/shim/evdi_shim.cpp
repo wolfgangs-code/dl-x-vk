@@ -61,6 +61,14 @@ public:
         return dlsym(m_real_libevdi, name);
     }
 
+    int GetHeadForHandleLocked(evdi_handle handle) {
+        auto dev_it = m_handle_to_device.find(handle);
+        if (dev_it != m_handle_to_device.end()) {
+            return (dev_it->second == 0) ? 0 : 1;
+        }
+        return 0;
+    }
+
     void OnOpen(evdi_handle handle, int device) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_handle_to_device[handle] = device;
@@ -69,24 +77,33 @@ public:
 
     void OnClose(evdi_handle handle) {
         std::lock_guard<std::mutex> lock(m_mutex);
+        int head_id = GetHeadForHandleLocked(handle);
+        VulkanConverter::Instance().UnregisterAllExternalBuffers(head_id);
         m_buffers.erase(handle);
         m_active_buffer.erase(handle);
         m_handle_to_device.erase(handle);
-        LOG_INFO("[EVDI-TURBO-SHIM] evdi_close: handle=%p", handle);
+        m_warmup_frames.erase(handle);
+        LOG_INFO("[EVDI-TURBO-SHIM] evdi_close: handle=%p (head=%d)", handle, head_id);
     }
 
     void OnRegisterBuffer(evdi_handle handle, struct evdi_buffer buffer) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_buffers[handle][buffer.id] = buffer;
         m_warmup_frames[handle] = 6;
-        LOG_INFO("[EVDI-TURBO-SHIM] evdi_register_buffer: handle=%p, id=%d, %dx%d, stride=%d, ptr=%p",
-                 handle, buffer.id, buffer.width, buffer.height, buffer.stride, buffer.buffer);
+        int head_id = GetHeadForHandleLocked(handle);
+        size_t fb_size = static_cast<size_t>(buffer.stride) * buffer.height;
+        bool ok = VulkanConverter::Instance().RegisterExternalBuffer(head_id, buffer.id, buffer.buffer, fb_size);
+        LOG_INFO("[EVDI-TURBO-SHIM] evdi_register_buffer: handle=%p (head=%d), id=%d, %dx%d, stride=%d, ptr=%p, zero_copy=%s",
+                 handle, head_id, buffer.id, buffer.width, buffer.height, buffer.stride, buffer.buffer,
+                 ok ? "YES" : "FALLBACK");
     }
 
     void OnUnregisterBuffer(evdi_handle handle, int bufferId) {
         std::lock_guard<std::mutex> lock(m_mutex);
+        int head_id = GetHeadForHandleLocked(handle);
+        VulkanConverter::Instance().UnregisterExternalBuffer(head_id, bufferId);
         m_buffers[handle].erase(bufferId);
-        LOG_INFO("[EVDI-TURBO-SHIM] evdi_unregister_buffer: handle=%p, id=%d", handle, bufferId);
+        LOG_INFO("[EVDI-TURBO-SHIM] evdi_unregister_buffer: handle=%p (head=%d), id=%d", handle, head_id, bufferId);
     }
 
     void OnRequestUpdate(evdi_handle handle, int bufferId) {
@@ -164,16 +181,12 @@ public:
             return;
         }
 
-        int head_id = 0;
-        auto dev_it = m_handle_to_device.find(handle);
-        if (dev_it != m_handle_to_device.end()) {
-            head_id = (dev_it->second == 0) ? 0 : 1;
-        }
+        int head_id = GetHeadForHandleLocked(handle);
 
         auto& vk = VulkanConverter::Instance();
         if (!vk.IsAvailable()) return;
 
-        // Run Vulkan SPIR-V GPU differencing with sub-region clipping!
+        // Run Vulkan SPIR-V GPU differencing with sub-region clipping (Vector 2 Zero-Copy)
         const int TILE_SIZE = 32;
         std::vector<TileCoordinate> dirty_tiles;
         bool ok = vk.DetectDirtyTiles(
@@ -231,10 +244,13 @@ public:
 
         uint64_t g = m_grab_count.load(std::memory_order_relaxed);
         if (g % 120 == 0) {
-            LOG_INFO("[EVDI-TURBO-SHIM] Stats: frames=%lu, passthru=%lu, suppressed=%lu, gpu_dirty=%lu, tiles=%zu",
+            LOG_INFO("[EVDI-TURBO-SHIM] Stats: frames=%lu, passthru=%lu, suppressed=%lu, gpu_dirty=%lu, zero_copy=%lu, fallback=%lu, tiles=%zu",
                      g, m_passthrough_count.load(std::memory_order_relaxed),
                      m_suppressed_count.load(std::memory_order_relaxed),
-                     m_dirty_count.load(std::memory_order_relaxed), dirty_tiles.size());
+                     m_dirty_count.load(std::memory_order_relaxed),
+                     vk.GetZeroCopyDispatchCount(),
+                     vk.GetFallbackDispatchCount(),
+                     dirty_tiles.size());
         }
     }
 
@@ -243,8 +259,9 @@ private:
         EnsureRealEvdi();
         auto& vk = VulkanConverter::Instance();
         if (vk.Initialize()) {
-            LOG_INFO("[EVDI-TURBO-SHIM] Vulkan compute engine initialized successfully (%s)",
-                     vk.GetDeviceName().c_str());
+            LOG_INFO("[EVDI-TURBO-SHIM] Vulkan compute engine initialized successfully (%s, zero-copy: %s)",
+                     vk.GetDeviceName().c_str(),
+                     vk.HasExternalMemoryHost() ? "ACTIVE" : "FALLBACK");
         } else {
             LOG_ERROR("[EVDI-TURBO-SHIM] Failed to initialize Vulkan compute engine");
         }
@@ -303,8 +320,6 @@ void* dlopen(const char* filename, int flags) {
 
 FORWARD_CALL(enum evdi_device_status, evdi_check_device, (int device), (device))
 FORWARD_CALL(int, evdi_add_device, (void), ())
-FORWARD_CALL(evdi_handle, evdi_open_attached_to, (const char* sysfs_parent_device), (sysfs_parent_device))
-FORWARD_CALL(evdi_handle, evdi_open_attached_to_fixed, (const char* sysfs_parent_device, size_t length), (sysfs_parent_device, length))
 
 evdi_handle evdi_open(int device) {
     static auto real_fn = reinterpret_cast<evdi_handle (*)(int)>(
@@ -313,6 +328,28 @@ evdi_handle evdi_open(int device) {
     evdi_handle h = real_fn(device);
     if (h != EVDI_INVALID_HANDLE) {
         dl_turbo::ShimManager::Instance().OnOpen(h, device);
+    }
+    return h;
+}
+
+evdi_handle evdi_open_attached_to(const char* sysfs_parent_device) {
+    static auto real_fn = reinterpret_cast<evdi_handle (*)(const char*)>(
+        dl_turbo::ShimManager::Instance().GetRealSymbol("evdi_open_attached_to"));
+    if (!real_fn) return EVDI_INVALID_HANDLE;
+    evdi_handle h = real_fn(sysfs_parent_device);
+    if (h != EVDI_INVALID_HANDLE) {
+        dl_turbo::ShimManager::Instance().OnOpen(h, 0);
+    }
+    return h;
+}
+
+evdi_handle evdi_open_attached_to_fixed(const char* sysfs_parent_device, size_t length) {
+    static auto real_fn = reinterpret_cast<evdi_handle (*)(const char*, size_t)>(
+        dl_turbo::ShimManager::Instance().GetRealSymbol("evdi_open_attached_to_fixed"));
+    if (!real_fn) return EVDI_INVALID_HANDLE;
+    evdi_handle h = real_fn(sysfs_parent_device, length);
+    if (h != EVDI_INVALID_HANDLE) {
+        dl_turbo::ShimManager::Instance().OnOpen(h, 0);
     }
     return h;
 }
