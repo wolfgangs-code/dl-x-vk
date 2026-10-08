@@ -480,9 +480,9 @@ bool VulkanConverter::DispatchTileDifferencing(
     vkCmdPushConstants(head.cmd_buffer[0], m_diff_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(DiffPushConstants), &pc);
 
-    // 8x8 workgroup size
-    uint32_t gx = (num_cols + 7) / 8;
-    uint32_t gy = (num_rows + 7) / 8;
+    // Each workgroup (32x4 invocations = 128 threads) tests exactly one 32x32 tile
+    uint32_t gx = num_cols;
+    uint32_t gy = num_rows;
     vkCmdDispatch(head.cmd_buffer[0], gx, gy, 1);
 
     if (vkEndCommandBuffer(head.cmd_buffer[0]) != VK_SUCCESS) return false;

@@ -15,4 +15,10 @@ sleep 4
 
 echo "[*] Checking service status:"
 systemctl status displaylink.service --no-pager | head -n 15
-echo "[*] Done! Both monitors should be restored."
+
+if command -v kscreen-doctor &>/dev/null; then
+    echo "[*] Ensuring KScreen outputs are enabled in Wayland..."
+    kscreen-doctor output.DVI-I-1.enable output.DVI-I-2.enable 2>/dev/null || true
+fi
+
+echo "[*] Done! Both monitors should be fully operational and glitch-free."
