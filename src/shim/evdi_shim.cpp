@@ -78,6 +78,7 @@ public:
     void OnRegisterBuffer(evdi_handle handle, struct evdi_buffer buffer) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_buffers[handle][buffer.id] = buffer;
+        m_warmup_frames[handle] = 6;
         LOG_INFO("[EVDI-TURBO-SHIM] evdi_register_buffer: handle=%p, id=%d, %dx%d, stride=%d, ptr=%p",
                  handle, buffer.id, buffer.width, buffer.height, buffer.stride, buffer.buffer);
     }
@@ -94,11 +95,21 @@ public:
     }
 
     void FilterDirtyPixels(evdi_handle handle, struct evdi_rect* rects, int* num_rects) {
-        if (!rects || !num_rects || *num_rects <= 0) return;
+        static bool s_passthrough = (getenv("EVDI_TURBO_PASSTHROUGH") != nullptr);
+        if (s_passthrough) return;
 
         m_grab_count.fetch_add(1, std::memory_order_relaxed);
 
         std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Warmup: Pass first 6 frames through cleanly to allow display initialization & sync
+        auto warm_it = m_warmup_frames.find(handle);
+        if (warm_it != m_warmup_frames.end() && warm_it->second > 0) {
+            warm_it->second--;
+            m_passthrough_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         auto buf_it = m_buffers.find(handle);
         if (buf_it == m_buffers.end() || buf_it->second.empty()) return;
 
@@ -264,6 +275,7 @@ private:
     std::unordered_map<evdi_handle, int> m_handle_to_device;
     std::unordered_map<evdi_handle, std::unordered_map<int, struct evdi_buffer>> m_buffers;
     std::unordered_map<evdi_handle, int> m_active_buffer;
+    std::unordered_map<evdi_handle, int> m_warmup_frames;
 
     std::atomic<uint64_t> m_grab_count{0};
     std::atomic<uint64_t> m_passthrough_count{0};
