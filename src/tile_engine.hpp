@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <vector>
 #include <memory>
-#include "protocol.hpp"
 
 namespace dl_turbo {
 

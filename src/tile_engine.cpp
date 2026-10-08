@@ -124,9 +124,9 @@ std::vector<TileCoordinate> TileEngine::FilterChangedTiles(
 ) {
     if (VulkanConverter::Instance().IsAvailable()) {
         std::vector<TileCoordinate> gpu_changed;
-        if (VulkanConverter::Instance().FilterDirtyTilesGpu(
+        if (VulkanConverter::Instance().DetectDirtyTiles(
                 master_fb, fb_stride, m_screen_width, m_screen_height,
-                m_tile_size, candidate_tiles, gpu_changed)) {
+                m_tile_size, gpu_changed)) {
             return gpu_changed;
         }
     }
