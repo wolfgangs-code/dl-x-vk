@@ -1,6 +1,7 @@
 #include "service.hpp"
 #include "vulkan_converter.hpp"
 #include <chrono>
+#include <fstream>
 
 namespace dl_turbo {
 
@@ -62,7 +63,27 @@ bool DisplayLinkService::Start() {
             if (h == 0) return false;
         } else {
             // 4. Attach display EDID
-            m_evdi[h]->ConnectDisplay(nullptr, 0);
+            static const std::string s_edid_candidates[MAX_HEADS] = {
+                "/var/log/displaylink/27M2N8500_PHLC34A-AU02446002422.edid",
+                "/var/log/displaylink/Acer KG221Q_ACR058E-2018.39.83907C0F.edid"
+            };
+
+            std::vector<uint8_t> edid_data;
+            if (h < 2 && !s_edid_candidates[h].empty()) {
+                std::ifstream edid_file(s_edid_candidates[h], std::ios::binary);
+                if (edid_file) {
+                    edid_data.assign(std::istreambuf_iterator<char>(edid_file),
+                                     std::istreambuf_iterator<char>());
+                    LOG_INFO("Head %d: Loaded physical monitor EDID (%zu bytes) from %s",
+                             h, edid_data.size(), s_edid_candidates[h].c_str());
+                }
+            }
+
+            if (!edid_data.empty()) {
+                m_evdi[h]->ConnectDisplay(edid_data.data(), edid_data.size());
+            } else {
+                m_evdi[h]->ConnectDisplay(nullptr, 0);
+            }
             LOG_INFO("Head %d: EVDI device successfully initialized and connected", h);
         }
     }
