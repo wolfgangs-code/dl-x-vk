@@ -889,7 +889,11 @@ bool VulkanConverter::DetectDirtyTiles(
     int height,
     int tile_size,
     std::vector<TileCoordinate>& out_dirty_tiles,
-    int head_id
+    int head_id,
+    int clip_x1,
+    int clip_y1,
+    int clip_x2,
+    int clip_y2
 ) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized) return false;
@@ -903,12 +907,46 @@ bool VulkanConverter::DetectDirtyTiles(
 
     if (!EnsureDiffBuffers(head_id, fb_size, total_tiles)) return false;
 
+    // Constrain clipping coordinates
+    if (clip_x2 <= clip_x1 || clip_y2 <= clip_y1) {
+        clip_x1 = 0; clip_y1 = 0;
+        clip_x2 = width; clip_y2 = height;
+    } else {
+        clip_x1 = std::max(0, clip_x1);
+        clip_y1 = std::max(0, clip_y1);
+        clip_x2 = std::min(width, clip_x2);
+        clip_y2 = std::min(height, clip_y2);
+    }
+
+    uint32_t start_col = clip_x1 / tile_size;
+    uint32_t start_row = clip_y1 / tile_size;
+    uint32_t end_col = (clip_x2 + tile_size - 1) / tile_size;
+    uint32_t end_row = (clip_y2 + tile_size - 1) / tile_size;
+    uint32_t num_cols = (end_col > start_col) ? (end_col - start_col) : 1;
+    uint32_t num_rows = (end_row > start_row) ? (end_row - start_row) : 1;
+
+    // Sub-region memory copy: only copy the rows within [clip_y1, clip_y2)
     if (curr_fb && curr_fb != head.buf_input[0].mapped && curr_fb != head.buf_input[1].mapped) {
-        std::memcpy(head.buf_input[0].mapped, curr_fb, fb_size);
+        if (clip_x1 == 0 && clip_x2 == width) {
+            size_t copy_offset = static_cast<size_t>(clip_y1) * fb_stride;
+            size_t copy_bytes = static_cast<size_t>(clip_y2 - clip_y1) * fb_stride;
+            std::memcpy(static_cast<uint8_t*>(head.buf_input[0].mapped) + copy_offset,
+                        curr_fb + copy_offset,
+                        copy_bytes);
+        } else {
+            size_t row_bytes = static_cast<size_t>(clip_x2 - clip_x1) * 4;
+            for (int y = clip_y1; y < clip_y2; ++y) {
+                size_t offset = static_cast<size_t>(y) * fb_stride + (clip_x1 * 4);
+                std::memcpy(static_cast<uint8_t*>(head.buf_input[0].mapped) + offset,
+                            curr_fb + offset,
+                            row_bytes);
+            }
+        }
     }
 
     int stride_words = fb_stride / 4;
-    if (!DispatchTileDifferencing(width, height, stride_words, tile_size, true, 0, 0, 0, 0, head_id)) {
+    if (!DispatchTileDifferencing(width, height, stride_words, tile_size, true,
+                                 start_col, start_row, num_cols, num_rows, head_id)) {
         return false;
     }
 

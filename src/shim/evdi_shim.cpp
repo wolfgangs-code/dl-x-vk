@@ -117,17 +117,51 @@ public:
         const auto& buf = it->second;
         if (!buf.buffer || buf.width <= 0 || buf.height <= 0 || buf.stride <= 0) return;
 
+        // Calculate bounding box and total damaged area from EVDI
+        int in_min_x = rects[0].x1, in_min_y = rects[0].y1;
+        int in_max_x = rects[0].x2, in_max_y = rects[0].y2;
+        int64_t total_damage_area = 0;
+
+        for (int i = 0; i < *num_rects; ++i) {
+            in_min_x = std::min(in_min_x, rects[i].x1);
+            in_min_y = std::min(in_min_y, rects[i].y1);
+            in_max_x = std::max(in_max_x, rects[i].x2);
+            in_max_y = std::max(in_max_y, rects[i].y2);
+            total_damage_area += static_cast<int64_t>(std::max(0, rects[i].x2 - rects[i].x1)) *
+                                 std::max(0, rects[i].y2 - rects[i].y1);
+        }
+
+        in_min_x = std::max(0, in_min_x);
+        in_min_y = std::max(0, in_min_y);
+        in_max_x = std::min(buf.width, in_max_x);
+        in_max_y = std::min(buf.height, in_max_y);
+
+        if (in_max_x <= in_min_x || in_max_y <= in_min_y) {
+            *num_rects = 0;
+            m_suppressed_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        int64_t screen_area = static_cast<int64_t>(buf.width) * buf.height;
+
+        // FAST-PATH: If damage is already small (< 25% of screen),
+        // pass through directly with ZERO CPU copy and ZERO GPU dispatch!
+        // DisplayLinkManager's internal SSE diffing loop handles small areas in < 0.05ms.
+        if (total_damage_area < (screen_area / 4)) {
+            m_passthrough_count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         int head_id = 0;
         auto dev_it = m_handle_to_device.find(handle);
         if (dev_it != m_handle_to_device.end()) {
-            // Map device 0 -> head 0, device 2 -> head 1
             head_id = (dev_it->second == 0) ? 0 : 1;
         }
 
         auto& vk = VulkanConverter::Instance();
         if (!vk.IsAvailable()) return;
 
-        // Run Vulkan SPIR-V GPU temporal differencing
+        // Run Vulkan SPIR-V GPU differencing with sub-region clipping!
         const int TILE_SIZE = 32;
         std::vector<TileCoordinate> dirty_tiles;
         bool ok = vk.DetectDirtyTiles(
@@ -137,14 +171,18 @@ public:
             buf.height,
             TILE_SIZE,
             dirty_tiles,
-            head_id
+            head_id,
+            in_min_x,
+            in_min_y,
+            in_max_x,
+            in_max_y
         );
 
         if (!ok) return;
 
         int orig_count = *num_rects;
         if (dirty_tiles.empty()) {
-            // Screen is completely unchanged! Suppress false update to eliminate CPU load
+            // Large damage was a false alarm from compositor! Suppress completely!
             *num_rects = 0;
             m_suppressed_count.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -177,7 +215,6 @@ public:
             }
             *num_rects = static_cast<int>(coalesced.size());
         } else {
-            // More rects than capacity: keep first (max_capacity - 1) and merge the rest into bounding box
             int keep = max_capacity - 1;
             for (int i = 0; i < keep; ++i) {
                 rects[i].x1 = coalesced[i].x1;
@@ -200,11 +237,11 @@ public:
             *num_rects = max_capacity;
         }
 
-        // Periodic diagnostic log (every ~120 frames = ~2 seconds)
         uint64_t g = m_grab_count.load(std::memory_order_relaxed);
         if (g % 120 == 0) {
-            LOG_INFO("[EVDI-TURBO-SHIM] Stats: frames=%lu, suppressed_clean=%lu, dirty_frames=%lu, tiles=%zu",
-                     g, m_suppressed_count.load(std::memory_order_relaxed),
+            LOG_INFO("[EVDI-TURBO-SHIM] Stats: frames=%lu, passthru=%lu, suppressed=%lu, gpu_dirty=%lu, tiles=%zu",
+                     g, m_passthrough_count.load(std::memory_order_relaxed),
+                     m_suppressed_count.load(std::memory_order_relaxed),
                      m_dirty_count.load(std::memory_order_relaxed), dirty_tiles.size());
         }
     }
@@ -229,6 +266,7 @@ private:
     std::unordered_map<evdi_handle, int> m_active_buffer;
 
     std::atomic<uint64_t> m_grab_count{0};
+    std::atomic<uint64_t> m_passthrough_count{0};
     std::atomic<uint64_t> m_suppressed_count{0};
     std::atomic<uint64_t> m_dirty_count{0};
 };

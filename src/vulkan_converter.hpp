@@ -59,7 +59,11 @@ public:
         int height,
         int tile_size,
         std::vector<TileCoordinate>& out_dirty_tiles,
-        int head_id = 0
+        int head_id = 0,
+        int clip_x1 = 0,
+        int clip_y1 = 0,
+        int clip_x2 = 0,
+        int clip_y2 = 0
     );
 
     // Filter candidate tiles against GPU dirty bitmask
