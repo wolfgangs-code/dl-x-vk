@@ -46,6 +46,8 @@ public:
 
     int GetWidth() const { return m_current_mode.width; }
     int GetHeight() const { return m_current_mode.height; }
+    int GetHeadIndex() const { return m_device_index; }
+    int GetCardIndex() const { return m_card_index; }
     bool IsActive() const { return m_handle != EVDI_INVALID_HANDLE; }
 
 private:
@@ -63,6 +65,7 @@ private:
     static void DdcciDataHandler(struct evdi_ddcci_data ddcci_data, void* user_data);
 
     int m_device_index;
+    int m_card_index = -1;
     evdi_handle m_handle;
     ScreenMode m_current_mode;
 

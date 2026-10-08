@@ -34,23 +34,46 @@ EvdiDevice::~EvdiDevice() {
 bool EvdiDevice::Open() {
     Close();
 
-    enum evdi_device_status status = evdi_check_device(m_device_index);
-    if (status == NOT_PRESENT) {
-        LOG_INFO("EVDI device %d not present, creating new device...", m_device_index);
+    // Dynamically discover available EVDI DRM card nodes
+    // Linux DRM enumerates all GPUs (/dev/dri/cardX); primary GPU may occupy card1, while EVDI occupies card0 and card2
+    auto find_card = [this]() -> int {
+        int found = 0;
+        for (int card = 0; card < 32; ++card) {
+            enum evdi_device_status status = evdi_check_device(card);
+            if (status == AVAILABLE) {
+                if (found == m_device_index) {
+                    return card;
+                }
+                found++;
+            }
+        }
+        return -1;
+    };
+
+    int chosen_card = find_card();
+    if (chosen_card == -1) {
+        LOG_INFO("Head %d: No available EVDI node found. Adding new EVDI device...", m_device_index);
         int added = evdi_add_device();
         if (added < 0) {
             LOG_ERROR("Failed to add EVDI device");
             return false;
         }
+        chosen_card = find_card();
     }
 
-    m_handle = evdi_open(m_device_index);
-    if (m_handle == EVDI_INVALID_HANDLE) {
-        LOG_ERROR("Failed to open EVDI device %d", m_device_index);
+    if (chosen_card == -1) {
+        LOG_ERROR("Failed to find or allocate EVDI card for Head %d", m_device_index);
         return false;
     }
 
-    LOG_INFO("Successfully opened EVDI device %d", m_device_index);
+    m_card_index = chosen_card;
+    m_handle = evdi_open(m_card_index);
+    if (m_handle == EVDI_INVALID_HANDLE) {
+        LOG_ERROR("Failed to open EVDI device at card %d (Head %d)", m_card_index, m_device_index);
+        return false;
+    }
+
+    LOG_INFO("Head %d: Successfully opened EVDI interface on /dev/dri/card%d", m_device_index, m_card_index);
 
     // Start background event pump
     m_running = true;
@@ -70,7 +93,8 @@ void EvdiDevice::Close() {
         FreeBuffers();
         evdi_close(m_handle);
         m_handle = EVDI_INVALID_HANDLE;
-        LOG_INFO("Closed EVDI device %d", m_device_index);
+        LOG_INFO("Head %d: Closed EVDI device on /dev/dri/card%d", m_device_index, m_card_index);
+        m_card_index = -1;
     }
 }
 
@@ -111,14 +135,14 @@ void EvdiDevice::AllocateBuffers(int width, int height) {
 
         uint8_t* ptr = nullptr;
         if (use_vk) {
-            ptr = vk.GetMappedInputBuffer(i, size);
+            ptr = vk.GetMappedInputBuffer(m_device_index, i, size);
         }
 
         if (ptr) {
             m_buffers[i].external = true;
             m_buffers[i].data_ptr = ptr;
             m_buffers[i].memory.clear();
-            LOG_INFO("EVDI Buffer %d registered directly to Vulkan mapped GPU buffer (Zero-Copy)", i);
+            LOG_INFO("EVDI [Head %d] Buffer %d registered directly to Vulkan mapped GPU buffer (Zero-Copy)", m_device_index, i);
         } else {
             m_buffers[i].external = false;
             m_buffers[i].memory.resize(size, 0);
