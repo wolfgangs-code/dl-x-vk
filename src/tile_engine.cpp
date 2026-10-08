@@ -23,29 +23,86 @@ void TileEngine::Resize(int screen_width, int screen_height) {
     m_tile_hashes.assign(m_grid_cols * m_grid_rows, 0);
 }
 
+static inline int64_t RectArea(const DirtyRect& r) {
+    if (r.x2 <= r.x1 || r.y2 <= r.y1) return 0;
+    return static_cast<int64_t>(r.x2 - r.x1) * (r.y2 - r.y1);
+}
+
+static inline DirtyRect RectUnion(const DirtyRect& a, const DirtyRect& b) {
+    return {
+        std::min(a.x1, b.x1),
+        std::min(a.y1, b.y1),
+        std::max(a.x2, b.x2),
+        std::max(a.y2, b.y2)
+    };
+}
+
+static inline bool RectsOverlapOrTouch(const DirtyRect& a, const DirtyRect& b) {
+    return !(a.x2 < b.x1 || a.x1 > b.x2 || a.y2 < b.y1 || a.y1 > b.y2);
+}
+
 std::vector<DirtyRect> TileEngine::CoalesceRects(const std::vector<DirtyRect>& rects) {
     if (rects.empty()) return {};
 
     std::vector<DirtyRect> merged;
+    merged.reserve(rects.size());
     for (const auto& r : rects) {
         if (r.x2 <= r.x1 || r.y2 <= r.y1) continue;
+        merged.push_back(r);
+    }
+    if (merged.size() <= 1) return merged;
 
-        bool fused = false;
-        for (auto& m : merged) {
-            // Check if rectangles intersect or touch
-            if (!(r.x2 < m.x1 || r.x1 > m.x2 || r.y2 < m.y1 || r.y1 > m.y2)) {
-                m.x1 = std::min(m.x1, r.x1);
-                m.y1 = std::min(m.y1, r.y1);
-                m.x2 = std::max(m.x2, r.x2);
-                m.y2 = std::max(m.y2, r.y2);
-                fused = true;
-                break;
+    // Transitive merge: iterate until all intersecting or touching rectangles are combined
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t i = 0; i < merged.size() && !changed; ++i) {
+            for (size_t j = i + 1; j < merged.size(); ++j) {
+                if (RectsOverlapOrTouch(merged[i], merged[j])) {
+                    merged[i] = RectUnion(merged[i], merged[j]);
+                    merged.erase(merged.begin() + j);
+                    changed = true;
+                    break;
+                }
             }
         }
-        if (!fused) {
-            merged.push_back(r);
-        }
     }
+    return merged;
+}
+
+std::vector<DirtyRect> TileEngine::ClusterRects(const std::vector<DirtyRect>& rects, size_t max_rects) {
+    auto merged = CoalesceRects(rects);
+    if (merged.size() <= max_rects || max_rects == 0) {
+        return merged;
+    }
+
+    // Agglomerative Hierarchical Minimum-Added-Area Clustering
+    // Greedily combine the pair (i, j) that adds the minimum dead space:
+    // Cost = Area(Union(i, j)) - Area(i) - Area(j)
+    while (merged.size() > max_rects) {
+        int64_t best_cost = -1;
+        size_t best_i = 0, best_j = 1;
+
+        for (size_t i = 0; i < merged.size(); ++i) {
+            int64_t area_i = RectArea(merged[i]);
+            for (size_t j = i + 1; j < merged.size(); ++j) {
+                int64_t area_j = RectArea(merged[j]);
+                DirtyRect u = RectUnion(merged[i], merged[j]);
+                int64_t area_u = RectArea(u);
+                int64_t cost = area_u - area_i - area_j; // dead space added
+
+                if (best_cost < 0 || cost < best_cost) {
+                    best_cost = cost;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+
+        merged[best_i] = RectUnion(merged[best_i], merged[best_j]);
+        merged.erase(merged.begin() + best_j);
+    }
+
     return merged;
 }
 

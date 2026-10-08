@@ -155,10 +155,11 @@ public:
 
         int64_t screen_area = static_cast<int64_t>(buf.width) * buf.height;
 
-        // FAST-PATH: If damage is already small (< 25% of screen),
-        // pass through directly with ZERO CPU copy and ZERO GPU dispatch!
-        // DisplayLinkManager's internal SSE diffing loop handles small areas in < 0.05ms.
-        if (total_damage_area < (screen_area / 4)) {
+        // ADAPTIVE FAST-PATH: Micro-damage (< 3% of screen or < 65K pixels, e.g. text cursor, tooltip)
+        // passes through directly with zero GPU dispatch.
+        // Medium & large updates (video, scrolling, window moves >= 3%) are accelerated by the Vulkan GPU shader!
+        int64_t micro_damage_threshold = std::min<int64_t>(65536, screen_area / 32);
+        if (total_damage_area < micro_damage_threshold) {
             m_passthrough_count.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -213,40 +214,20 @@ public:
             });
         }
 
-        auto coalesced = TileEngine::CoalesceRects(tile_rects);
         int max_capacity = std::min(orig_count, 16);
         if (max_capacity <= 0) max_capacity = 16;
 
-        if (static_cast<int>(coalesced.size()) <= max_capacity) {
-            for (size_t i = 0; i < coalesced.size(); ++i) {
-                rects[i].x1 = coalesced[i].x1;
-                rects[i].y1 = coalesced[i].y1;
-                rects[i].x2 = coalesced[i].x2;
-                rects[i].y2 = coalesced[i].y2;
-            }
-            *num_rects = static_cast<int>(coalesced.size());
-        } else {
-            int keep = max_capacity - 1;
-            for (int i = 0; i < keep; ++i) {
-                rects[i].x1 = coalesced[i].x1;
-                rects[i].y1 = coalesced[i].y1;
-                rects[i].x2 = coalesced[i].x2;
-                rects[i].y2 = coalesced[i].y2;
-            }
-            int min_x = coalesced[keep].x1, min_y = coalesced[keep].y1;
-            int max_x = coalesced[keep].x2, max_y = coalesced[keep].y2;
-            for (size_t i = keep + 1; i < coalesced.size(); ++i) {
-                min_x = std::min(min_x, coalesced[i].x1);
-                min_y = std::min(min_y, coalesced[i].y1);
-                max_x = std::max(max_x, coalesced[i].x2);
-                max_y = std::max(max_y, coalesced[i].y2);
-            }
-            rects[keep].x1 = min_x;
-            rects[keep].y1 = min_y;
-            rects[keep].x2 = max_x;
-            rects[keep].y2 = max_y;
-            *num_rects = max_capacity;
+        // Agglomerative Minimum-Cost Hierarchical Clustering:
+        // Fuses adjacent/nearby tiles while keeping separate windows isolated,
+        // avoiding accidental full-screen bounding box bloat!
+        auto clustered = TileEngine::ClusterRects(tile_rects, max_capacity);
+        for (size_t i = 0; i < clustered.size(); ++i) {
+            rects[i].x1 = clustered[i].x1;
+            rects[i].y1 = clustered[i].y1;
+            rects[i].x2 = clustered[i].x2;
+            rects[i].y2 = clustered[i].y2;
         }
+        *num_rects = static_cast<int>(clustered.size());
 
         uint64_t g = m_grab_count.load(std::memory_order_relaxed);
         if (g % 120 == 0) {

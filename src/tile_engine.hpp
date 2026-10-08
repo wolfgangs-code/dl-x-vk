@@ -36,6 +36,9 @@ public:
     // Coalesce overlapping or adjacent dirty rectangles into minimal bounding boxes
     static std::vector<DirtyRect> CoalesceRects(const std::vector<DirtyRect>& rects);
 
+    // Cluster dirty rectangles to at most max_rects using agglomerative minimum-dead-area reduction
+    static std::vector<DirtyRect> ClusterRects(const std::vector<DirtyRect>& rects, size_t max_rects = 16);
+
     // Extract raw pixels for a specific tile from the master frame buffer
     void ExtractTileRgb32(
         const uint8_t* master_fb,
