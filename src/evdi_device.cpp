@@ -75,6 +75,9 @@ bool EvdiDevice::Open() {
 
     LOG_INFO("Head %d: Successfully opened EVDI interface on /dev/dri/card%d", m_device_index, m_card_index);
 
+    // Disable EVDI virtual hardware cursor events so KWin compositor renders the cursor cleanly without fallback thrashing
+    evdi_enable_cursor_events(m_handle, false);
+
     // Start background event pump
     m_running = true;
     m_event_thread = std::thread(&EvdiDevice::EventLoop, this);
