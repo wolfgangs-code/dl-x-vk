@@ -40,13 +40,9 @@ endif()
 message(STATUS "Found evdi headers: ${EVDI_INCLUDE_DIR}")
 message(STATUS "Found vulkan: ${VULKAN_LIBRARY}")
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
-
 # Vulkan EVDI Turbo Shim Library
 set(SHIM_SOURCES
     src/shim/evdi_shim.cpp
-    src/shim/usb_shim.cpp
     src/vulkan_converter.cpp
     src/tile_engine.cpp
 )
@@ -60,12 +56,10 @@ target_include_directories(evdi_turbo PRIVATE
     src
     include
     ${EVDI_INCLUDE_DIR}
-    ${LIBUSB_INCLUDE_DIRS}
 )
 
 target_link_libraries(evdi_turbo PRIVATE
     ${VULKAN_LIBRARY}
-    ${LIBUSB_LIBRARIES}
     dl
     pthread
 )

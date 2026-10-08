@@ -79,13 +79,6 @@ def get_top_threads(pid):
     except Exception:
         return []
 
-def get_recent_usb_logs(lines_count=30):
-    try:
-        out = subprocess.check_output(["journalctl", "-u", "displaylink.service", "-n", str(lines_count), "--no-pager"]).decode()
-        return [l for l in out.splitlines() if "[USB-" in l or "[EVDI-TURBO" in l]
-    except Exception:
-        return []
-
 def sample_metrics(pid, label, duration_sec=15):
     num_cpus = os.cpu_count() or 1
     samples = []
@@ -119,7 +112,6 @@ def sample_metrics(pid, label, duration_sec=15):
         p0 = p1
 
     top_threads = get_top_threads(pid)
-    usb_logs = get_recent_usb_logs(35)
 
     avg_proc = sum(s["proc_cpu"] for s in samples) / len(samples)
     peak_proc = max(s["proc_cpu"] for s in samples)
@@ -135,8 +127,7 @@ def sample_metrics(pid, label, duration_sec=15):
         "avg_rss_mb": avg_rss,
         "avg_gpu": avg_gpu,
         "avg_threads": avg_th,
-        "top_threads": top_threads,
-        "usb_logs": usb_logs
+        "top_threads": top_threads
     }
 
 def main():
@@ -217,7 +208,6 @@ def main():
 
     top_vanilla_str = "\n".join(f"  {t}" for t in vanilla_results.get("top_threads", []))
     top_turbo_str = "\n".join(f"  {t}" for t in turbo_results.get("top_threads", []))
-    usb_log_str = "\n".join(f"  {l}" for l in turbo_results.get("usb_logs", []))
 
     report = f"""
 ========================================================================================
@@ -235,9 +225,6 @@ def main():
 
 --- TOP ACTIVE THREADS (TURBO SHIM) ---
 {top_turbo_str}
-
---- LIVE USB TURBO TELEMETRY ---
-{usb_log_str if usb_log_str else '  (No telemetry captured in window)'}
 ========================================================================================
 """
     print(report)
@@ -265,11 +252,6 @@ def main():
 ### Top Active Threads (Turbo Shim)
 ```
 {top_turbo_str}
-```
-
-### USB Transmission Telemetry
-```
-{usb_log_str if usb_log_str else 'No telemetry lines captured'}
 ```
 
 ### Key Takeaway
