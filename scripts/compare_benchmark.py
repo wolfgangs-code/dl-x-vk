@@ -72,6 +72,20 @@ def get_gpu_percent():
     except Exception:
         return -1
 
+def get_top_threads(pid):
+    try:
+        out = subprocess.check_output(["ps", "-T", "-p", str(pid), "-o", "tid,pcpu,comm", "--sort=-pcpu"]).decode()
+        return [l.strip() for l in out.strip().splitlines()[1:8]]
+    except Exception:
+        return []
+
+def get_recent_usb_logs(lines_count=30):
+    try:
+        out = subprocess.check_output(["journalctl", "-u", "displaylink.service", "-n", str(lines_count), "--no-pager"]).decode()
+        return [l for l in out.splitlines() if "[USB-" in l or "[EVDI-TURBO" in l]
+    except Exception:
+        return []
+
 def sample_metrics(pid, label, duration_sec=15):
     num_cpus = os.cpu_count() or 1
     samples = []
@@ -104,6 +118,9 @@ def sample_metrics(pid, label, duration_sec=15):
         t0, idle0 = t1, idle1
         p0 = p1
 
+    top_threads = get_top_threads(pid)
+    usb_logs = get_recent_usb_logs(35)
+
     avg_proc = sum(s["proc_cpu"] for s in samples) / len(samples)
     peak_proc = max(s["proc_cpu"] for s in samples)
     avg_sys = sum(s["sys_cpu"] for s in samples) / len(samples)
@@ -117,7 +134,9 @@ def sample_metrics(pid, label, duration_sec=15):
         "avg_sys_cpu": avg_sys,
         "avg_rss_mb": avg_rss,
         "avg_gpu": avg_gpu,
-        "avg_threads": avg_th
+        "avg_threads": avg_th,
+        "top_threads": top_threads,
+        "usb_logs": usb_logs
     }
 
 def main():
@@ -196,6 +215,10 @@ def main():
     sys_reduction = vanilla_results["avg_sys_cpu"] - turbo_results["avg_sys_cpu"]
     mem_saved = vanilla_results["avg_rss_mb"] - turbo_results["avg_rss_mb"]
 
+    top_vanilla_str = "\n".join(f"  {t}" for t in vanilla_results.get("top_threads", []))
+    top_turbo_str = "\n".join(f"  {t}" for t in turbo_results.get("top_threads", []))
+    usb_log_str = "\n".join(f"  {l}" for l in turbo_results.get("usb_logs", []))
+
     report = f"""
 ========================================================================================
                       EMPIRICAL STRESS TEST BENCHMARK RESULTS
@@ -208,6 +231,13 @@ def main():
  Memory Footprint (RSS)        | {vanilla_results['avg_rss_mb']:6.1f} MB                 | {turbo_results['avg_rss_mb']:6.1f} MB                 | -{mem_saved:5.1f} MB
  Active OS Thread Count        | {vanilla_results['avg_threads']:6.0f} threads               | {turbo_results['avg_threads']:6.0f} threads               | -{vanilla_results['avg_threads'] - turbo_results['avg_threads']:.0f} threads
  Average GPU Busy Time         | {vanilla_results['avg_gpu']:6.1f}%                    | {turbo_results['avg_gpu']:6.1f}%                    | -{vanilla_results['avg_gpu'] - turbo_results['avg_gpu']:5.1f}%
+========================================================================================
+
+--- TOP ACTIVE THREADS (TURBO SHIM) ---
+{top_turbo_str}
+
+--- LIVE USB TURBO TELEMETRY ---
+{usb_log_str if usb_log_str else '  (No telemetry captured in window)'}
 ========================================================================================
 """
     print(report)
@@ -231,6 +261,16 @@ def main():
 | **Memory Footprint (RSS)** | **{vanilla_results['avg_rss_mb']:.1f} MB** | **{turbo_results['avg_rss_mb']:.1f} MB** | **-{mem_saved:.1f} MB** |
 | **Active OS Thread Count** | **{vanilla_results['avg_threads']:.0f} threads** | **{turbo_results['avg_threads']:.0f} threads** | **-{vanilla_results['avg_threads'] - turbo_results['avg_threads']:.0f} threads** |
 | **Average GPU Busy Time** | **{vanilla_results['avg_gpu']:.1f}%** | **{turbo_results['avg_gpu']:.1f}%** | **-{vanilla_results['avg_gpu'] - turbo_results['avg_gpu']:.1f}%** |
+
+### Top Active Threads (Turbo Shim)
+```
+{top_turbo_str}
+```
+
+### USB Transmission Telemetry
+```
+{usb_log_str if usb_log_str else 'No telemetry lines captured'}
+```
 
 ### Key Takeaway
 Both physical displays remained illuminated and fully functional throughout the benchmark test. The Vulkan compute engine offloads dirty macro-tile detection and difference evaluation from the CPU to the AMD GPU shaders, eliminating the software SSE diffing bottleneck.
